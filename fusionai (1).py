@@ -2,7 +2,6 @@
 Requirements: fastapi uvicorn python-pptx openpyxl python-docx requests cryptography
 """
 import subprocess, sys, os, json, uuid, base64, hashlib, sqlite3, time as _time
-import tempfile, shutil, platform as _platform
 from datetime import datetime
 from functools import wraps
 
@@ -14,7 +13,6 @@ import requests as req
 import io, re as _re, base64 as _b64
 
 app = FastAPI()
-_SERVER_START = _time.time()
 
 _raw_secret    = os.environ.get("SECRET_KEY","")
 SECRET         = _raw_secret.encode() if _raw_secret else os.urandom(32)
@@ -277,7 +275,7 @@ def healthy_chat_models(avail):
     for k,m in MODELS.items():
         if k not in seen and m.get("type","chat")=="chat" and m["provider"] in avail and is_healthy(k): yield k
 
-def _call_overseer(sys_p, user_p, max_tokens=400, cheap=False):
+def _call_overseer(sys_p, user_p, max_tokens=400, cheap=False, timeout=30):
     key=GROQ_KEY.strip() or OPENROUTER_KEY.strip()
     if not key: return None
     ep="https://api.groq.com/openai/v1/chat/completions" if GROQ_KEY.strip() else "https://openrouter.ai/api/v1/chat/completions"
@@ -288,9 +286,10 @@ def _call_overseer(sys_p, user_p, max_tokens=400, cheap=False):
     hdrs={"Authorization":f"Bearer {key}","Content-Type":"application/json"}
     if "openrouter" in ep: hdrs["HTTP-Referer"]="https://huggingface.co/spaces"
     try:
-        r=req.post(ep,headers=hdrs,json={"model":model,"messages":[{"role":"system","content":sys_p},{"role":"user","content":user_p}],"max_tokens":max_tokens},timeout=12)
+        r=req.post(ep,headers=hdrs,json={"model":model,"messages":[{"role":"system","content":sys_p},{"role":"user","content":user_p}],"max_tokens":max_tokens},timeout=timeout)
         if r.ok: return r.json()["choices"][0]["message"]["content"].strip()
-    except: pass
+        print(f"[overseer] {r.status_code}: {r.text[:200]}", flush=True)
+    except Exception as _oe: print(f"[overseer] {type(_oe).__name__}: {_oe}", flush=True)
     return None
 
 MODEL_PROFILES = {
@@ -914,51 +913,29 @@ async def detect_intent(request:Request):
     if tl.startswith("/video "): return J({"intent":"video","prompt":text[7:].strip()})
     if tl.startswith("/3d "): return J({"intent":"video3d","prompt":text[4:].strip()})
     intent="chat"
-    # 3D model intent
-    for kw in ["generate a 3d","create a 3d","make a 3d","3d model","3d render","3d object"]:
+    for kw in ["generate a 3d","create a 3d","make a 3d","3d model"]:
         if kw in tl: intent="video3d"; break
-    # Video intent
-    for kw in ["generate a video","create a video","make a video","animate","video of","video showing"]:
+    for kw in ["generate a video","create a video","make a video"]:
         if kw in tl and intent=="chat": intent="video"; break
-    # ── Image intent — ONLY unambiguous visual-creation phrasing ────────────
-    # (kept tight on purpose: false positives here hijack normal chat into the
-    #  image overseer flow, which breaks the chat experience entirely)
-    IMAGE_KWS=[
-        "generate an image","generate a photo","generate a picture","generate art",
-        "create an image","create a photo","create a picture","create artwork","create art of",
-        "make an image","make a photo","make a picture","make artwork","make art of",
-        "produce an image","produce a picture",
-        "draw me","draw a ","draw an ","paint me","paint a ","paint an ",
-        "sketch me","sketch a ","sketch an ","illustrate a ","illustrate an ",
-        "render me an image","render a picture","render an image",
-        "design a logo","design an icon","design artwork",
-        "imagine a picture","imagine an image",
-        "a picture of ","a photo of ","a photograph of ","a portrait of ",
-        "a painting of ","a drawing of ","a sketch of ",
-        "an illustration of ","an artwork of ",
+    # Only unambiguous image-creation phrases — NOT "draw a conclusion", "picture this" etc
+    IMAGE_EXACT=[
+        "generate an image","generate a photo","generate a picture",
+        "create an image","create a photo","create a picture","create artwork",
+        "make an image","make a photo","make a picture",
+        "draw me a","draw me an","paint me a","paint me an",
+        "sketch me a","sketch me an","illustrate a ","illustrate an ",
+        "a picture of ","a photo of ","a painting of ","a drawing of ",
+        "a sketch of ","an illustration of ",
         "show me a photo of","show me an image of","show me a picture of",
-        "show me a drawing of","show me a painting of",
-        "draw what","sketch what",
-        "in the style of a painting","as a digital painting","as an oil painting",
-        "photorealistic image of","8k render of","digital art of",
-        "anime style art of","cartoon drawing of","pixel art of",
-        "logo for my","icon of a",
-        "wallpaper of ","desktop background of ",
+        "design a logo","design an icon","logo for my","icon for my",
+        "photorealistic image of","digital art of","anime art of","pixel art of",
+        "8k image of","wallpaper of ","generate art of ",
     ]
-    for kw in IMAGE_KWS:
-        if kw in tl and intent=="chat":
-            intent="image"; break
-    # Hard exclusions: never treat these as image intent even if a keyword matched
+    for kw in IMAGE_EXACT:
+        if kw in tl and intent=="chat": intent="image"; break
+    # Override back to chat if explanation words present
     if intent=="image":
-        chat_signals=["explain","describe","tell me about","what is","how does","why does",
-                      "when did","who is","analyse","analyze","summarise","summarize","list ",
-                      "compare","code","function","error","bug","fix ","debug","script","算",
-                      "meaning of","definition","difference between"]
-        if any(cs in tl for cs in chat_signals): intent="chat"
-    # math/code/analysis always go to chat
-    for kw in ["solve","calculate","integral","derivative","equation","matrix","proof","theorem","formula",
-                "write code","debug","fix the","implement","algorithm"]:
-        if kw in tl: intent="chat"; break
+        if any(w in tl for w in ["explain","describe","what is","how does","tell me","why","when","who","code","script","function","bug","fix","error","calculate","solve"]): intent="chat"
     return J({"intent":intent,"prompt":text})
 # ── Mega Free API Router ──────────────────────────────────────────────────────
 _FREE_APIS = {
@@ -2837,8 +2814,6 @@ body.light pre{background:rgba(220,228,250,.5)!important;color:#1e3a5f!important
 /* ══ File Creator Modal ════════════════════════════════════════════════ */
 .file-modal-overlay{position:fixed;inset:0;z-index:99999;background:rgba(2,4,12,0.8);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;animation:fadeIn .18s ease}
 .file-modal-overlay.hidden{display:none}
-.modal-overlay{position:fixed;inset:0;z-index:99999;background:rgba(2,4,12,0.8);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;animation:fadeIn .18s ease;padding:20px;box-sizing:border-box}
-.modal-overlay.hidden{display:none}
 .file-modal{background:rgba(6,10,26,0.98);border:1px solid rgba(60,100,200,.35);border-radius:22px;width:520px;max-width:95vw;max-height:88vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 40px 100px rgba(0,0,0,.8),0 0 80px rgba(26,110,245,.08);animation:slideup .2s cubic-bezier(.16,1,.3,1)}
 .file-modal-head{display:flex;align-items:center;justify-content:space-between;padding:20px 22px 14px;border-bottom:1px solid rgba(40,70,140,.25)}
 .file-modal-title{font-size:16px;font-weight:700;color:#e8f4ff;letter-spacing:.2px}
@@ -2852,110 +2827,6 @@ body.light pre{background:rgba(220,228,250,.5)!important;color:#1e3a5f!important
 .ftype-card-icon{font-size:22px;margin-bottom:4px}
 .ftype-card-name{font-size:11px;font-weight:700;color:#c8e0ff}
 .ftype-card-ext{font-size:9px;color:rgba(80,120,180,.7);margin-top:1px;font-family:'DM Mono',monospace}
-/* Computer + SVG art modal shared styles */
-.comp-chip{background:rgba(26,110,245,.12);border:1px solid rgba(26,110,245,.25);border-radius:20px;padding:4px 10px;font-size:11px;color:var(--tx2);cursor:pointer;transition:all .15s;white-space:nowrap}
-.comp-chip:hover{background:rgba(26,110,245,.22);border-color:rgba(26,110,245,.5);color:var(--tx)}
-.comp-src-card{background:rgba(255,255,255,.04);border:1px solid var(--glass-bdr);border-radius:10px;padding:10px 12px;margin-bottom:8px;transition:all .15s}
-.comp-src-card:hover{border-color:rgba(26,110,245,.35);background:rgba(26,110,245,.05)}
-.comp-cite{display:inline-block;background:rgba(26,110,245,.18);border:1px solid rgba(26,110,245,.3);border-radius:4px;padding:1px 5px;font-size:10px;font-weight:700;color:var(--blue);cursor:pointer;margin:0 2px;vertical-align:super;line-height:1.4}
-.comp-cite:hover{background:rgba(26,110,245,.3)}
-.comp-answer{font-size:14px;line-height:1.75;color:var(--tx);padding:4px 0}
-.comp-answer h1,.comp-answer h2,.comp-answer h3{color:var(--tx);margin:12px 0 6px}
-.comp-answer code{background:rgba(255,255,255,.08);border-radius:4px;padding:1px 5px;font-size:12px}
-.comp-answer strong{color:var(--tx)}
-.comp-related-chip{background:rgba(255,255,255,.05);border:1px solid var(--glass-bdr);border-radius:8px;padding:7px 12px;font-size:12px;color:var(--tx2);cursor:pointer;transition:all .15s;text-align:left}
-.comp-related-chip:hover{border-color:rgba(26,110,245,.4);background:rgba(26,110,245,.08);color:var(--tx)}
-/* ══ FusionOS ════════════════════════════════════════════════════════════ */
-#fusionos-overlay{position:fixed;inset:0;z-index:9500;display:none;flex-direction:column;background:#06070f;font-family:'Segoe UI','Inter',system-ui,sans-serif}
-#fusionos-overlay.fos-open{display:flex}
-#fos-menubar{height:26px;background:rgba(8,10,20,.95);backdrop-filter:blur(24px);border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;padding:0 10px;gap:0;z-index:10;flex-shrink:0;-webkit-user-select:none;user-select:none}
-.fosm-logo{font-size:13px;font-weight:800;letter-spacing:.5px;background:linear-gradient(120deg,#4a9eff,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-right:16px;cursor:pointer;padding:0 4px}
-.fosm-item{font-size:11.5px;color:rgba(255,255,255,.68);padding:2px 9px;border-radius:5px;cursor:pointer;transition:background .1s;white-space:nowrap}
-.fosm-item:hover{background:rgba(255,255,255,.1);color:#fff}
-.fosm-right{margin-left:auto;display:flex;align-items:center;gap:14px}
-.fosm-badge{font-size:9px;background:rgba(45,164,78,.2);border:1px solid rgba(45,164,78,.4);border-radius:10px;padding:1px 7px;color:#6ee77a}
-.fosm-clock{font-size:11px;color:rgba(255,255,255,.5);font-variant-numeric:tabular-nums;min-width:56px;text-align:right;letter-spacing:.3px}
-#fos-desktop{flex:1;position:relative;overflow:hidden;background:radial-gradient(ellipse at 25% 20%,#0c1a3e 0%,#04060f 55%,#000 100%)}
-#fos-desktop::before{content:'';position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.028) 1px,transparent 1px);background-size:28px 28px;pointer-events:none}
-#fos-desktop::after{content:'';position:absolute;bottom:0;left:0;right:0;height:120px;background:linear-gradient(to top,rgba(0,0,0,.5),transparent);pointer-events:none}
-#fos-dock{height:64px;background:rgba(8,10,20,.9);backdrop-filter:blur(30px);border-top:1px solid rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;gap:6px;padding:0 20px;flex-shrink:0;z-index:10}
-.fos-dock-btn{display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;padding:5px 10px;border-radius:12px;transition:all .16s;position:relative;border:none;background:none}
-.fos-dock-btn:hover{background:rgba(255,255,255,.08);transform:translateY(-5px)}
-.fos-dock-btn:hover .fos-dock-ico{transform:scale(1.18)}
-.fos-dock-ico{font-size:26px;transition:transform .16s;filter:drop-shadow(0 3px 7px rgba(0,0,0,.6))}
-.fos-dock-lbl{font-size:9px;color:rgba(255,255,255,.4);font-weight:500;white-space:nowrap}
-.fos-dock-dot{position:absolute;bottom:1px;left:50%;transform:translateX(-50%);width:4px;height:4px;border-radius:50%;background:#4a9eff;display:none}
-.fos-dock-btn.fos-running .fos-dock-dot{display:block}
-/* Windows */
-.fos-win{position:absolute;background:rgba(12,16,28,.97);border:1px solid rgba(255,255,255,.09);border-radius:13px;box-shadow:0 20px 60px rgba(0,0,0,.85),0 0 0 1px rgba(255,255,255,.03);display:flex;flex-direction:column;overflow:hidden;min-width:280px;min-height:180px}
-.fos-win.fos-focused{border-color:rgba(74,158,255,.28);box-shadow:0 24px 80px rgba(0,0,0,.9),0 0 0 1px rgba(74,158,255,.12)}
-.fos-win.fos-minimized{display:none}
-.fos-titlebar{height:36px;background:rgba(14,18,34,.99);display:flex;align-items:center;padding:0 12px;gap:9px;cursor:move;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.05);-webkit-user-select:none;user-select:none}
-.fos-traffic{display:flex;gap:6px;flex-shrink:0}
-.fos-tb{width:12px;height:12px;border-radius:50%;border:none;cursor:pointer;transition:filter .1s;flex-shrink:0;outline:none}
-.fos-tb:hover{filter:brightness(1.5)}
-.fos-close{background:#ff5f56}.fos-min{background:#ffbd2e}.fos-max{background:#27c93f}
-.fos-win-icon{font-size:13px;flex-shrink:0}.fos-win-title{font-size:12px;color:rgba(255,255,255,.7);font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.fos-content{flex:1;overflow:hidden;position:relative;display:flex;flex-direction:column}
-.fos-resizer{position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:se-resize;z-index:6;display:flex;align-items:flex-end;justify-content:flex-end;padding:3px;opacity:.45}
-.fos-resizer::before{content:'⌟';font-size:13px;color:rgba(255,255,255,.6)}
-.fos-rz{position:absolute;z-index:5}
-.fos-rz-n{top:-3px;left:8px;right:8px;height:6px;cursor:n-resize}
-.fos-rz-s{bottom:-3px;left:8px;right:8px;height:6px;cursor:s-resize}
-.fos-rz-e{top:8px;right:-3px;bottom:8px;width:6px;cursor:e-resize}
-.fos-rz-w{top:8px;left:-3px;bottom:8px;width:6px;cursor:w-resize}
-.fos-rz-ne{top:-3px;right:-3px;width:12px;height:12px;cursor:ne-resize}
-.fos-rz-nw{top:-3px;left:-3px;width:12px;height:12px;cursor:nw-resize}
-.fos-rz-sw{bottom:-3px;left:-3px;width:12px;height:12px;cursor:sw-resize}
-/* Terminal app */
-.fos-term{background:#07080f;color:#d8e8f8;font-family:'Cascadia Code','Fira Code','DM Mono','Courier New',monospace;font-size:13px;height:100%;display:flex;flex-direction:column}
-.fos-term-out{flex:1;overflow-y:auto;padding:10px 14px;line-height:1.65;white-space:pre-wrap;word-break:break-all}
-.fos-term-out::-webkit-scrollbar{width:4px}.fos-term-out::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:2px}
-.fos-term-row{display:flex;align-items:center;padding:5px 12px;border-top:1px solid rgba(255,255,255,.04);flex-shrink:0;gap:7px}
-.fos-term-prompt{color:#4a9eff;font-weight:700;font-size:13px;white-space:nowrap;font-family:inherit}
-.fos-term-inp{flex:1;background:none;border:none;outline:none;color:#d8e8f8;font-family:inherit;font-size:13px;caret-color:#4a9eff}
-.fos-cmd{color:#7ec8e3}.fos-ok{color:#7ee8a2}.fos-err{color:#ff8585}.fos-ai{color:#c084fc;font-style:italic}.fos-info{color:rgba(200,220,255,.4)}
-/* Files app */
-.fos-files{display:flex;height:100%}
-.fos-files-sb{width:150px;background:rgba(6,8,16,.7);border-right:1px solid rgba(255,255,255,.05);padding:8px 5px;overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column;gap:1px}
-.fos-files-main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.fos-files-bar{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.05);display:flex;align-items:center;gap:7px;flex-shrink:0}
-.fos-files-list{flex:1;overflow-y:auto;padding:6px}
-.fos-fitem{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:7px;cursor:pointer;transition:background .1s;border:1px solid transparent}
-.fos-fitem:hover{background:rgba(255,255,255,.05)}
-.fos-fitem.fos-sel{background:rgba(74,158,255,.14);border-color:rgba(74,158,255,.2)}
-.fos-fname{font-size:12px;color:#c0d4f0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fos-fmeta{font-size:9px;color:rgba(255,255,255,.25);white-space:nowrap}
-.fos-sb-btn{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:7px;cursor:pointer;font-size:11px;color:rgba(255,255,255,.5);transition:all .1s;border:none;background:none;width:100%;text-align:left}
-.fos-sb-btn:hover{background:rgba(255,255,255,.07);color:#fff}
-/* Editor app */
-.fos-editor{display:flex;flex-direction:column;height:100%}
-.fos-editor-bar{display:flex;align-items:center;padding:5px 9px;gap:7px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0;background:rgba(8,10,18,.8)}
-.fos-editor-ta{flex:1;background:#07080f;color:#d8e8f8;font-family:'Cascadia Code','Fira Code','DM Mono',monospace;font-size:13px;border:none;outline:none;resize:none;padding:12px 14px;line-height:1.65;tab-size:2}
-.fos-statusbar{height:22px;background:rgba(6,8,16,.9);border-top:1px solid rgba(255,255,255,.04);display:flex;align-items:center;padding:0 12px;flex-shrink:0}
-/* Agent app */
-.fos-agent{display:flex;flex-direction:column;height:100%;background:#070910}
-.fos-agent-log{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
-.fos-agent-log::-webkit-scrollbar{width:4px}.fos-agent-log::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:2px}
-.fos-step{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:9px 11px;font-size:12px;animation:fadeIn .2s}
-.fos-step.fos-step-ok{border-color:rgba(78,230,120,.18)}
-.fos-step.fos-step-err{border-color:rgba(255,100,100,.2)}
-.fos-step-cmd{font-family:'Cascadia Code',monospace;font-size:11px;color:#7ec8e3;margin-bottom:4px;word-break:break-all}
-.fos-step-out{color:rgba(200,220,255,.55);white-space:pre-wrap;max-height:120px;overflow-y:auto;font-size:11px;font-family:'Cascadia Code',monospace;line-height:1.5}
-.fos-agent-footer{padding:10px 12px;border-top:1px solid rgba(255,255,255,.05);flex-shrink:0;display:flex;flex-direction:column;gap:7px}
-/* Monitor app */
-.fos-monitor{padding:12px;display:flex;flex-direction:column;gap:8px;overflow-y:auto;height:100%;background:#06080e}
-.fos-mon-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.fos-mon-card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:10px 12px}
-.fos-mon-lbl{font-size:9px;color:rgba(255,255,255,.35);font-weight:700;letter-spacing:.7px;text-transform:uppercase;margin-bottom:5px}
-.fos-mon-val{font-size:11px;font-weight:600;color:#c0d4ff;font-family:'Cascadia Code',monospace;white-space:pre;overflow:hidden}
-/* Context menu */
-.fos-ctx{position:fixed;background:rgba(14,18,32,.97);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:5px;z-index:99999;min-width:155px;box-shadow:0 10px 36px rgba(0,0,0,.8)}
-.fos-ctx-item{padding:6px 13px;font-size:12px;color:rgba(255,255,255,.78);border-radius:6px;cursor:pointer;transition:background .1s}
-.fos-ctx-item:hover{background:rgba(74,158,255,.18);color:#fff}
-.fos-ctx-sep{height:1px;background:rgba(255,255,255,.07);margin:4px 0}
-@keyframes fosWinIn{from{opacity:0;transform:scale(.94) translateY(8px)}to{opacity:1;transform:none}}
-.fos-win{animation:fosWinIn .18s ease-out}
 .file-topic-wrap{margin-bottom:12px}
 .file-topic-label{font-size:11px;font-weight:600;color:rgba(120,160,220,.8);margin-bottom:6px;letter-spacing:.3px;text-transform:uppercase}
 .file-topic-input{width:100%;background:rgba(8,14,34,.7);border:1px solid rgba(40,70,160,.3);border-radius:10px;padding:10px 13px;font-size:13px;color:#e8f4ff;outline:none;font-family:'DM Sans',sans-serif;transition:border-color .15s;resize:none}
@@ -3373,23 +3244,17 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
           <div class="toolbox-divider"></div>
           <div class="toolbox-section">Generate</div>
           <div class="toolbox-item" onclick="openSP('imagine');closeToolbox()"><span class="toolbox-item-icon">🎨</span><div><div class="toolbox-item-label">Generate Image</div><div class="toolbox-item-desc">AI image creation</div></div></div>
-          <div class="toolbox-item" onclick="openSvgImageGen();closeToolbox()"><span class="toolbox-item-icon">🖼</span><div><div class="toolbox-item-label">AI Art (Free/Fast)</div><div class="toolbox-item-desc">LLM → SVG → PNG, no API needed</div></div></div>
+          <div class="toolbox-item" onclick="openSvgGen();closeToolbox()"><span class="toolbox-item-icon">🖼</span><div><div class="toolbox-item-label">AI Art (Free)</div><div class="toolbox-item-desc">LLM → SVG → PNG, no API cost</div></div></div>
           <div class="toolbox-divider"></div>
-          <div class="toolbox-section">Computer</div>
-          <div class="toolbox-item" onclick="openComputer();closeToolbox()"><span class="toolbox-item-icon">🖥</span><div><div class="toolbox-item-label">AI Computer</div><div class="toolbox-item-desc">Search web, read pages, get cited answers</div></div></div>
-          <div class="toolbox-item" onclick="openFusionOS();closeToolbox()"><span class="toolbox-item-icon">⬛</span><div><div class="toolbox-item-label">FusionOS</div><div class="toolbox-item-desc">AI-powered OS — terminal, files, editor, agent</div></div></div>
+          <div class="toolbox-section">Power Tools</div>
+          <div class="toolbox-item" onclick="openFusionOS();closeToolbox()"><span class="toolbox-item-icon">⬛</span><div><div class="toolbox-item-label">FusionOS</div><div class="toolbox-item-desc">AI desktop — terminal, files, code, agent</div></div></div>
+          <div class="toolbox-item" onclick="openComputer();closeToolbox()"><span class="toolbox-item-icon">🖥</span><div><div class="toolbox-item-label">AI Computer</div><div class="toolbox-item-desc">Web search → cited AI answer</div></div></div>
+          <div class="toolbox-item" onclick="openFileCreator();closeToolbox()"><span class="toolbox-item-icon">📁</span><div><div class="toolbox-item-label">Create File</div><div class="toolbox-item-desc">Doc, CSV, PPT, code…</div></div></div>
         </div>
       </div>
       <div class="tbar-sep"></div>
-      <!-- Computer button -->
-      <button class="tbar-btn" id="tbtn-computer" onclick="openComputer()" title="Perplexity-style AI Computer">🖥 <span>Computer</span></button>
-      <!-- FusionOS button -->
-      <button class="tbar-btn" id="tbtn-os" onclick="openFusionOS()" title="FusionOS — AI-powered VM with terminal, files, code editor and autonomous AI agent" style="background:linear-gradient(135deg,rgba(74,158,255,.15),rgba(168,85,247,.15));border-color:rgba(168,85,247,.3)">⬛ <span>FusionOS</span></button>
-      <!-- File Creator button -->
-      <button class="tbar-btn" id="tbtn-file" onclick="openFileCreator()" title="Create any file — doc, CSV, PPT, code...">📁 <span>Create File</span></button>
-      <div class="tbar-sep"></div>
-      <button class="tbar-btn" id="tbtn-arena" onclick="openArena()" title="5 AI models answer simultaneously — pick the best">🏆 <span>Arena</span></button>
-      <button class="tbar-btn" id="tbtn-edt" onclick="openExtremeThink()" title="Extreme Deep Think: 10+ searches + all models thinking 5 rounds">🧠 <span>Deep Think</span></button>
+      <button class="tbar-btn" id="tbtn-os" onclick="openFusionOS()" style="background:linear-gradient(135deg,rgba(74,158,255,.14),rgba(168,85,247,.14));border-color:rgba(168,85,247,.28)">⬛ <span>FusionOS</span></button>
+      <button class="tbar-btn" id="tbtn-file" onclick="openFileCreator()">📁 <span>Files</span></button>
       <div class="tbar-sep"></div>
       <div class="tok-ctr" id="tokCtr" title="~tokens in message">
         <span class="tok-num" id="tokNum">0</span><span style="font-size:9px;color:var(--tx3)">tok</span>
@@ -4031,134 +3896,6 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
   </div>
 </div>
 
-<!-- ══ FusionOS — AI-powered Desktop OS ═══════════════════════════════════ -->
-<div id="fusionos-overlay">
-  <div id="fos-menubar">
-    <div class="fosm-logo" onclick="fosShowAbout()">⬛ FusionOS</div>
-    <div class="fosm-item" onclick="fosOpenApp('terminal')">Terminal</div>
-    <div class="fosm-item" onclick="fosOpenApp('files')">Files</div>
-    <div class="fosm-item" onclick="fosOpenApp('editor')">Editor</div>
-    <div class="fosm-item" onclick="fosOpenApp('agent')">Agent</div>
-    <div class="fosm-item" onclick="fosOpenApp('monitor')">Monitor</div>
-    <div class="fosm-right">
-      <span class="fosm-badge">🟢 LIVE SANDBOX</span>
-      <span class="fosm-clock" id="fosClock">00:00</span>
-      <span class="fosm-item" style="padding:2px 10px" onclick="closeFusionOS()" title="Exit FusionOS">✕ Exit</span>
-    </div>
-  </div>
-  <div id="fos-desktop"></div>
-  <div id="fos-dock">
-    <button class="fos-dock-btn" data-app="terminal" onclick="fosOpenApp('terminal')" title="Terminal"><span class="fos-dock-ico">🖳</span><span class="fos-dock-lbl">Terminal</span><span class="fos-dock-dot"></span></button>
-    <button class="fos-dock-btn" data-app="files" onclick="fosOpenApp('files')" title="Files"><span class="fos-dock-ico">🗂</span><span class="fos-dock-lbl">Files</span><span class="fos-dock-dot"></span></button>
-    <button class="fos-dock-btn" data-app="editor" onclick="fosOpenApp('editor')" title="Code Editor"><span class="fos-dock-ico">📝</span><span class="fos-dock-lbl">Editor</span><span class="fos-dock-dot"></span></button>
-    <button class="fos-dock-btn" data-app="agent" onclick="fosOpenApp('agent')" title="AI Agent — give it a task"><span class="fos-dock-ico">🤖</span><span class="fos-dock-lbl">Agent</span><span class="fos-dock-dot"></span></button>
-    <button class="fos-dock-btn" data-app="monitor" onclick="fosOpenApp('monitor')" title="System Monitor"><span class="fos-dock-ico">📊</span><span class="fos-dock-lbl">Monitor</span><span class="fos-dock-dot"></span></button>
-  </div>
-</div>
-
-<!-- ══ AI Computer Modal (Perplexity-style) ══════════════════════════════ -->
-<div class="modal-overlay hidden" id="computerOverlay" onclick="if(event.target===this)closeComputer()">
-  <div id="computerModal" style="background:var(--bg2);border:1px solid var(--glass-bdr2);border-radius:20px;width:min(96vw,820px);max-height:90vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.7)">
-    <div style="display:flex;align-items:center;gap:12px;padding:18px 20px 14px;border-bottom:1px solid var(--glass-bdr);flex-shrink:0">
-      <span style="font-size:22px">🖥</span>
-      <div style="flex:1">
-        <div style="font-size:16px;font-weight:700;color:var(--tx)">AI Computer</div>
-        <div style="font-size:11px;color:var(--tx3);margin-top:1px">Searches the web · reads pages · gives cited answers like Perplexity</div>
-      </div>
-      <button onclick="closeComputer()" style="background:none;border:none;color:var(--tx3);font-size:18px;cursor:pointer;padding:4px 8px;border-radius:8px">✕</button>
-    </div>
-    <div style="padding:16px 20px;flex-shrink:0;border-bottom:1px solid var(--glass-bdr)">
-      <div style="display:flex;gap:8px">
-        <input id="compQuery" placeholder="Ask anything — news, research, facts, comparisons…" onkeydown="if(event.key==='Enter'&&!event.shiftKey)runComputer()"
-          style="flex:1;background:rgba(255,255,255,.06);border:1px solid var(--glass-bdr2);border-radius:10px;padding:10px 14px;color:var(--tx);font-size:13px;outline:none"/>
-        <select id="compDepth" style="background:rgba(255,255,255,.06);border:1px solid var(--glass-bdr2);border-radius:10px;padding:8px 10px;color:var(--tx);font-size:12px;cursor:pointer">
-          <option value="fast">⚡ Fast (3 sources)</option>
-          <option value="normal" selected>🔍 Normal (6 sources)</option>
-          <option value="deep">🔬 Deep (10 sources)</option>
-        </select>
-        <button onclick="runComputer()" style="background:var(--grad);border:none;border-radius:10px;padding:10px 18px;color:#fff;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap">Search ↵</button>
-      </div>
-      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap" id="compSuggestions">
-        <span style="font-size:10px;color:var(--tx3);padding-top:4px">Try:</span>
-        <button class="comp-chip" onclick="setComp('Latest AI news today')">Latest AI news</button>
-        <button class="comp-chip" onclick="setComp('Best programming languages 2025')">Best languages 2025</button>
-        <button class="comp-chip" onclick="setComp('How does quantum computing work')">Quantum computing</button>
-        <button class="comp-chip" onclick="setComp('Current Bitcoin price and trend')">Bitcoin price</button>
-        <button class="comp-chip" onclick="setComp('Top 5 free AI tools right now')">Free AI tools</button>
-      </div>
-    </div>
-    <div id="compBody" style="flex:1;overflow-y:auto;padding:0">
-      <div id="compPlaceholder" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 30px;gap:16px;text-align:center">
-        <div style="font-size:48px;opacity:.35">🖥</div>
-        <div style="font-size:15px;color:var(--tx2);font-weight:600">Your AI-powered research assistant</div>
-        <div style="font-size:12px;color:var(--tx3);max-width:380px;line-height:1.6">Search the web, read real pages, and get a synthesized answer with inline citations — faster than doing it yourself</div>
-      </div>
-      <div id="compResult" style="display:none;padding:20px"></div>
-    </div>
-    <div style="padding:12px 20px;border-top:1px solid var(--glass-bdr);flex-shrink:0;display:flex;justify-content:space-between;align-items:center">
-      <div id="compStatus" style="font-size:11px;color:var(--tx3)"></div>
-      <button onclick="sendComputerToChat()" id="compSendBtn" style="display:none;background:rgba(26,110,245,.18);border:1px solid rgba(26,110,245,.4);border-radius:8px;padding:7px 14px;color:var(--blue);font-size:12px;font-weight:600;cursor:pointer">📤 Send to Chat</button>
-    </div>
-  </div>
-</div>
-
-<!-- ══ SVG Image Gen Modal ════════════════════════════════════════════════ -->
-<div class="modal-overlay hidden" id="svgImgOverlay" onclick="if(event.target===this)closeSvgImg()">
-  <div style="background:var(--bg2);border:1px solid var(--glass-bdr2);border-radius:20px;width:min(96vw,600px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.7)">
-    <div style="display:flex;align-items:center;gap:12px;padding:18px 20px 14px;border-bottom:1px solid var(--glass-bdr)">
-      <span style="font-size:22px">🖼</span>
-      <div style="flex:1">
-        <div style="font-size:16px;font-weight:700;color:var(--tx)">AI Art — Free & Fast</div>
-        <div style="font-size:11px;color:var(--tx3);margin-top:1px">Uses LLM → generates SVG art → converts to PNG image. No image API needed.</div>
-      </div>
-      <button onclick="closeSvgImg()" style="background:none;border:none;color:var(--tx3);font-size:18px;cursor:pointer;padding:4px 8px;border-radius:8px">✕</button>
-    </div>
-    <div style="padding:18px 20px">
-      <textarea id="svgImgPrompt" rows="3" placeholder="Describe what you want to see — e.g. 'a futuristic city at night with neon lights', 'abstract geometric art in blue and gold'…"
-        style="width:100%;background:rgba(255,255,255,.06);border:1px solid var(--glass-bdr2);border-radius:10px;padding:11px 14px;color:var(--tx);font-size:13px;resize:vertical;outline:none;box-sizing:border-box"></textarea>
-      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-        <select id="svgStyle" style="background:rgba(255,255,255,.06);border:1px solid var(--glass-bdr2);border-radius:9px;padding:8px 10px;color:var(--tx);font-size:12px;flex:1;cursor:pointer">
-          <option value="detailed illustration">🎨 Detailed Illustration</option>
-          <option value="minimalist vector art">◼ Minimalist Vector</option>
-          <option value="neon cyberpunk art">🌆 Neon Cyberpunk</option>
-          <option value="watercolor painting">🖌 Watercolor</option>
-          <option value="flat design icon style">📐 Flat Design</option>
-          <option value="realistic landscape">🏔 Realistic Landscape</option>
-          <option value="abstract geometric art">🔷 Abstract Geometric</option>
-          <option value="cartoon comic style">💬 Cartoon / Comic</option>
-          <option value="dark fantasy art">🌑 Dark Fantasy</option>
-          <option value="infographic diagram">📊 Infographic</option>
-        </select>
-        <select id="svgSize" style="background:rgba(255,255,255,.06);border:1px solid var(--glass-bdr2);border-radius:9px;padding:8px 10px;color:var(--tx);font-size:12px;cursor:pointer">
-          <option value="800 600">Landscape 800×600</option>
-          <option value="600 800">Portrait 600×800</option>
-          <option value="800 800">Square 800×800</option>
-          <option value="1200 400">Wide Banner</option>
-        </select>
-      </div>
-      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap" id="svgChips">
-        <span style="font-size:10px;color:var(--tx3);padding-top:5px">Quick:</span>
-        <button class="comp-chip" onclick="setSvgPrompt('a futuristic city at night with glowing neon lights and flying cars')">🌆 Futuristic City</button>
-        <button class="comp-chip" onclick="setSvgPrompt('a majestic dragon flying over snowy mountains at sunset')">🐉 Dragon</button>
-        <button class="comp-chip" onclick="setSvgPrompt('a beautiful coral reef with colorful fish and tropical sea life')">🐠 Coral Reef</button>
-        <button class="comp-chip" onclick="setSvgPrompt('abstract flowing geometric shapes in gold and deep blue')">🔷 Abstract Art</button>
-      </div>
-    </div>
-    <div id="svgPreview" style="display:none;padding:0 20px 16px">
-      <div style="border:1px solid var(--glass-bdr);border-radius:12px;overflow:hidden;text-align:center">
-        <canvas id="svgCanvas" style="max-width:100%;display:block;margin:0 auto"></canvas>
-      </div>
-      <div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">
-        <button onclick="downloadSvgPng()" style="background:rgba(26,110,245,.18);border:1px solid rgba(26,110,245,.4);border-radius:8px;padding:7px 14px;color:var(--blue);font-size:12px;font-weight:600;cursor:pointer">⬇ Download PNG</button>
-        <button onclick="sendSvgToChat()" style="background:var(--grad);border:none;border-radius:8px;padding:7px 14px;color:#fff;font-size:12px;font-weight:600;cursor:pointer">📤 Send to Chat</button>
-      </div>
-    </div>
-    <div style="padding:14px 20px;border-top:1px solid var(--glass-bdr);display:flex;gap:8px">
-      <button onclick="runSvgImg()" id="svgGenBtn" style="flex:1;background:var(--grad);border:none;border-radius:10px;padding:11px;color:#fff;font-size:13px;font-weight:700;cursor:pointer">✨ Generate Art</button>
-    </div>
-  </div>
-</div>
-
 <!-- ══ File Creator Modal ════════════════════════════════════════════════ -->
 <div class="file-modal-overlay hidden" id="fileModalOverlay" onclick="fileModalClickOut(event)">
   <div class="file-modal" id="fileModal">
@@ -4166,9 +3903,8 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
       <div class="file-modal-title">🗂 Create a File</div>
       <button class="file-modal-close" onclick="closeFileCreator()">&#x2715;</button>
     </div>
-    <div class="file-modal-body" id="file-modal-body-inner">
+    <div class="file-modal-body">
       <div class="file-type-grid" id="fileTypeGrid"></div>
-      <div id="pptOptions" style="display:none;margin-top:4px;padding:0 2px"></div>
       <div class="file-topic-wrap">
         <div class="file-topic-label">Topic / Description</div>
         <textarea class="file-topic-input" id="fileTopicInput" rows="3" placeholder="e.g. Sales data for Q1 2026 with product, region and revenue columns..."></textarea>
@@ -6257,7 +5993,7 @@ function _genFileCard(name, content){
     // Binary: download via server endpoint
     var serverEp=dlExt==='pptx'?'/api/gen_pptx':dlExt==='xlsx'?'/api/gen_xlsx':'/api/gen_docx';
     _ffc_content_map[cardId]=content.trim();
-  var themeExtra=(dlExt==='pptx'?', (window._pendingPptTheme||\'dark\'), (window._pendingPptAspect||\'169\')':'');
+  var themeExtra=(dlExt==='pptx'?', \'dark\'':'');
   cardHtml+='<button class="ffc-dl" onclick="_ffcBinaryDl(this,\''+cardId+'\',\''+serverEp+'\',\''+escHtml(dlName)+'\''+themeExtra+')"' +'>⬇ Download '+dlExt.toUpperCase()+'</button>';
   } else {
     // Text: blob URL
@@ -6275,13 +6011,12 @@ function _genFileCard(name, content){
   return cardHtml;
 }
 
-async function _ffcBinaryDl(btn,cardId,endpoint,filename,theme,aspect){
+async function _ffcBinaryDl(btn,cardId,endpoint,filename,theme){
   var content=_ffc_content_map[cardId]||'';
   if(!content){showToast('⚠️ Content not found — try regenerating');return;}
   btn.textContent='⏳ Generating…'; btn.disabled=true;
   try{
-    var body={content:content,filename:filename,theme:theme||'dark',aspect:aspect||'169'};
-    var resp=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var resp=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:content,filename:filename,theme:theme||'dark'})});
     if(!resp.ok){var err=await resp.json(); throw new Error(err.error||'Server error');}
     var blob=await resp.blob();
     var url=URL.createObjectURL(blob);
@@ -7398,646 +7133,6 @@ document.addEventListener('click',function(e){
   if(wrap&&!wrap.contains(e.target)){closeToolbox();}
 });
 
-// ══ AI Computer (Perplexity-style) ══════════════════════════════════════════
-var _compLastResult='', _compLastSources=[];
-function openComputer(){
-  document.getElementById('computerOverlay').classList.remove('hidden');
-  setTimeout(function(){document.getElementById('compQuery').focus();},150);
-}
-function closeComputer(){ document.getElementById('computerOverlay').classList.add('hidden'); }
-function setComp(q){ document.getElementById('compQuery').value=q; runComputer(); }
-
-async function runComputer(){
-  var query=document.getElementById('compQuery').value.trim();
-  if(!query){showToast('Type a question first');return;}
-  var depth=document.getElementById('compDepth').value;
-  var numSrc={fast:3,normal:6,deep:10}[depth]||6;
-  document.getElementById('compPlaceholder').style.display='none';
-  document.getElementById('compSendBtn').style.display='none';
-  var res=document.getElementById('compResult');
-  res.style.display='block';
-  res.innerHTML='<div style="display:flex;flex-direction:column;gap:14px">'
-    +'<div style="display:flex;align-items:center;gap:10px"><div class="thinking-dots"><span></span><span></span><span></span></div>'
-    +'<span style="color:var(--tx2);font-size:13px" id="compStep">🔍 Searching the web…</span></div>'
-    +'<div style="height:3px;background:var(--glass-bdr);border-radius:3px;overflow:hidden"><div id="compProg" style="height:100%;background:var(--grad);border-radius:3px;transition:width 0.6s;width:5%"></div></div>'
-    +'</div>';
-  document.getElementById('compStatus').textContent='';
-  var prog=document.getElementById('compProg');
-  var step=document.getElementById('compStep');
-  function setP(p,t){if(prog)prog.style.width=p+'%';if(step)step.textContent=t;}
-  try{
-    setP(15,'🔍 Searching the web…');
-    var sr=await apiFetch('/api/computer',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({query:query,depth:depth,num_sources:numSrc})});
-    if(!sr.ok){var e=await sr.json();throw new Error(e.error||'Computer failed');}
-    setP(60,'📖 Reading sources…');
-    var d=await sr.json();
-    setP(90,'🧠 Synthesising answer…');
-    _compLastResult=d.answer||'';
-    _compLastSources=d.sources||[];
-    // Render result
-    var srcHtml='<div style="margin-bottom:16px"><div style="font-size:10px;font-weight:700;letter-spacing:1px;color:var(--tx3);text-transform:uppercase;margin-bottom:8px">📚 Sources ('+d.sources.length+')</div>'
-      +'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:6px">';
-    d.sources.forEach(function(s,i){
-      srcHtml+='<div class="comp-src-card" onclick="window.open(\''+escHtml(s.url)+'\',\'_blank\')" style="cursor:pointer">'
-        +'<div style="display:flex;align-items:center;gap:7px">'
-        +'<span class="comp-cite">'+(i+1)+'</span>'
-        +'<div style="min-width:0"><div style="font-size:11px;font-weight:600;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+escHtml(s.title||s.url)+'</div>'
-        +'<div style="font-size:9px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+escHtml(s.url)+'</div></div></div></div>';
-    });
-    srcHtml+='</div></div>';
-    var ansHtml='<div class="comp-answer" style="margin-bottom:18px">'
-      +markdownToHtml(d.answer||'No answer generated.')
-      +'</div>';
-    var relHtml='';
-    if(d.related&&d.related.length){
-      relHtml='<div><div style="font-size:10px;font-weight:700;letter-spacing:1px;color:var(--tx3);text-transform:uppercase;margin-bottom:8px">💡 Related Questions</div>'
-        +'<div style="display:flex;flex-direction:column;gap:6px">';
-      d.related.forEach(function(r){
-        relHtml+='<button class="comp-related-chip" onclick="setComp('+JSON.stringify(r)+')">→ '+escHtml(r)+'</button>';
-      });
-      relHtml+='</div></div>';
-    }
-    setP(100,'✅ Done');
-    res.innerHTML=srcHtml+ansHtml+relHtml;
-    var elapsed=d.elapsed_ms?Math.round(d.elapsed_ms/100)/10+'s':'';
-    document.getElementById('compStatus').textContent=(d.sources.length)+' sources · '+elapsed;
-    document.getElementById('compSendBtn').style.display='inline-block';
-  } catch(e){
-    res.innerHTML='<div style="color:var(--red);padding:20px">❌ '+escHtml(e.message)+'</div>';
-  }
-}
-
-function sendComputerToChat(){
-  var q=document.getElementById('compQuery').value.trim();
-  var txt='[Computer Search: '+q+']\n\n'+_compLastResult;
-  closeComputer();
-  addMsg('ai',txt,null,null);
-  hist.push({role:'assistant',content:txt});
-}
-
-// ══ SVG / Free Image Gen ════════════════════════════════════════════════════
-var _svgPngB64='', _currentSvgText='';
-function openSvgImageGen(){
-  document.getElementById('svgImgOverlay').classList.remove('hidden');
-  document.getElementById('svgPreview').style.display='none';
-  setTimeout(function(){document.getElementById('svgImgPrompt').focus();},150);
-}
-function closeSvgImg(){ document.getElementById('svgImgOverlay').classList.add('hidden'); }
-function setSvgPrompt(t){ document.getElementById('svgImgPrompt').value=t; }
-
-async function runSvgImg(){
-  var prompt=document.getElementById('svgImgPrompt').value.trim();
-  if(!prompt){showToast('Describe what you want to see');return;}
-  var style=document.getElementById('svgStyle').value;
-  var sizeVal=document.getElementById('svgSize').value.split(' ');
-  var W=parseInt(sizeVal[0])||800, H=parseInt(sizeVal[1])||600;
-  var btn=document.getElementById('svgGenBtn');
-  btn.textContent='⏳ Generating…'; btn.disabled=true;
-  document.getElementById('svgPreview').style.display='none';
-  try{
-    var r=await apiFetch('/api/gen_svg_img',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({prompt:prompt,style:style,width:W,height:H})});
-    var d=await r.json();
-    if(d.error) throw new Error(d.error);
-    _currentSvgText=d.svg;
-    // Render SVG → canvas → PNG
-    var canvas=document.getElementById('svgCanvas');
-    canvas.width=W; canvas.height=H;
-    var ctx=canvas.getContext('2d');
-    var svgBlob=new Blob([d.svg],{type:'image/svg+xml;charset=utf-8'});
-    var url=URL.createObjectURL(svgBlob);
-    var img=new Image();
-    img.onload=function(){
-      ctx.drawImage(img,0,0,W,H);
-      URL.revokeObjectURL(url);
-      _svgPngB64=canvas.toDataURL('image/png').split(',')[1];
-      document.getElementById('svgPreview').style.display='block';
-      showToast('🎨 Art generated!');
-    };
-    img.onerror=function(){
-      // Fallback: inject SVG directly as innerHTML preview
-      document.getElementById('svgPreview').innerHTML='<div style="border:1px solid var(--glass-bdr);border-radius:12px;overflow:hidden">'+d.svg+'</div>';
-      document.getElementById('svgPreview').style.display='block';
-    };
-    img.src=url;
-  } catch(e){
-    showToast('❌ '+e.message);
-  }
-  btn.textContent='✨ Generate Art'; btn.disabled=false;
-}
-
-function downloadSvgPng(){
-  if(!_svgPngB64){showToast('Generate an image first');return;}
-  var a=document.createElement('a');
-  a.href='data:image/png;base64,'+_svgPngB64;
-  a.download='fusion-art.png'; a.click();
-}
-
-function sendSvgToChat(){
-  if(!_svgPngB64){showToast('Generate an image first');return;}
-  closeSvgImg();
-  // Show as image in chat
-  var bbl=addMsg('ai','',null,null);
-  var prompt=document.getElementById('svgImgPrompt').value;
-  bbl.innerHTML='<div style="display:flex;flex-direction:column;gap:8px">'
-    +'<img src="data:image/png;base64,'+_svgPngB64+'" style="max-width:100%;border-radius:12px;border:1px solid var(--glass-bdr2);cursor:zoom-in" onclick="openImgFull(this.src)"/>'
-    +'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">'
-    +'<span style="font-size:10px;color:var(--tx3)">🖼 AI Art (SVG→PNG) · Free</span>'
-    +'<div style="display:flex;gap:6px">'
-    +'<button class="mact" onclick="downloadSvgPng()">⬇ Download</button>'
-    +'<button class="mact" onclick="_attachGenImgData(\''+_svgPngB64+'\',\'image/png\')">📎 Use in Chat</button>'
-    +'</div></div></div>';
-  hist.push({role:'assistant',content:'[AI Art: '+prompt+']'});
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// FusionOS — AI-powered desktop OS (window manager + apps)
-// ══════════════════════════════════════════════════════════════════════════
-var _fos = {
-  windows: {},      // id -> {el, app, x,y,w,h, minimized, maximized, prevRect}
-  zTop: 100,
-  nextId: 1,
-  cwd: '',           // current terminal working dir (relative to sandbox)
-  clockTimer: null,
-};
-
-function openFusionOS(){
-  document.getElementById('fusionos-overlay').classList.add('fos-open');
-  if(!_fos.clockTimer){
-    _fosTickClock();
-    _fos.clockTimer = setInterval(_fosTickClock, 1000);
-  }
-  if(Object.keys(_fos.windows).length===0){
-    fosOpenApp('terminal');
-    setTimeout(function(){ fosOpenApp('agent', {x: 30, y: 60}); }, 80);
-  }
-}
-function closeFusionOS(){ document.getElementById('fusionos-overlay').classList.remove('fos-open'); }
-function _fosTickClock(){
-  var d=new Date();
-  var hh=String(d.getHours()).padStart(2,'0'), mm=String(d.getMinutes()).padStart(2,'0');
-  var el=document.getElementById('fosClock'); if(el) el.textContent=hh+':'+mm;
-}
-function fosShowAbout(){ showToast('⬛ FusionOS — your personal AI-powered sandbox VM'); }
-
-// ── Window manager ──────────────────────────────────────────────────────────
-var _FOS_APP_META = {
-  terminal: {icon:'🖳', title:'Terminal', w:620, h:420},
-  files:    {icon:'🗂', title:'Files',    w:680, h:460},
-  editor:   {icon:'📝', title:'Editor',   w:700, h:480},
-  agent:    {icon:'🤖', title:'AI Agent', w:420, h:560},
-  monitor:  {icon:'📊', title:'Monitor',  w:460, h:480},
-};
-
-function fosOpenApp(appName, opts){
-  opts = opts || {};
-  var meta = _FOS_APP_META[appName] || {icon:'⬛',title:appName,w:560,h:420};
-  // If a singleton window of this app type with no special opts exists, focus it
-  if(!opts.forceNew){
-    for(var id in _fos.windows){
-      var w = _fos.windows[id];
-      if(w.app===appName && !opts.path){ fosFocusWin(id); if(w.minimized) fosToggleMin(id); return id; }
-    }
-  }
-  var id = 'fosw'+(_fos.nextId++);
-  var desktop = document.getElementById('fos-desktop');
-  var dRect = desktop.getBoundingClientRect();
-  var x = opts.x!=null?opts.x:Math.max(20, Math.min(dRect.width-meta.w-20, 60+Object.keys(_fos.windows).length*28));
-  var y = opts.y!=null?opts.y:Math.max(16, Math.min(dRect.height-meta.h-20, 30+Object.keys(_fos.windows).length*24));
-  var w = opts.w||meta.w, h = opts.h||meta.h;
-
-  var win = document.createElement('div');
-  win.className = 'fos-win'; win.id = id;
-  win.style.cssText = 'left:'+x+'px;top:'+y+'px;width:'+w+'px;height:'+h+'px;z-index:'+(++_fos.zTop);
-  win.innerHTML =
-    '<div class="fos-titlebar" data-winid="'+id+'">'
-      +'<div class="fos-traffic">'
-        +'<button class="fos-tb fos-close" onclick="fosCloseWin(\''+id+'\')" title="Close"></button>'
-        +'<button class="fos-tb fos-min" onclick="fosToggleMin(\''+id+'\')" title="Minimize"></button>'
-        +'<button class="fos-tb fos-max" onclick="fosToggleMax(\''+id+'\')" title="Maximize"></button>'
-      +'</div>'
-      +'<span class="fos-win-icon">'+meta.icon+'</span><span class="fos-win-title">'+(opts.title||meta.title)+'</span>'
-    +'</div>'
-    +'<div class="fos-content" id="'+id+'-body"></div>'
-    +'<div class="fos-rz fos-rz-n" data-d="n"></div><div class="fos-rz fos-rz-s" data-d="s"></div>'
-    +'<div class="fos-rz fos-rz-e" data-d="e"></div><div class="fos-rz fos-rz-w" data-d="w"></div>'
-    +'<div class="fos-rz fos-rz-ne" data-d="ne"></div><div class="fos-rz fos-rz-nw" data-d="nw"></div>'
-    +'<div class="fos-rz fos-rz-sw" data-d="sw"></div>'
-    +'<div class="fos-resizer" data-winid="'+id+'" data-d="se"></div>';
-  desktop.appendChild(win);
-
-  _fos.windows[id] = {el:win, app:appName, x:x,y:y,w:w,h:h, minimized:false, maximized:false, prevRect:null};
-  _fosMakeDraggable(win, id);
-  _fosMakeResizable(win, id);
-  win.addEventListener('mousedown', function(){ fosFocusWin(id); });
-  fosFocusWin(id);
-
-  // Render the app body
-  var body = document.getElementById(id+'-body');
-  if(appName==='terminal') _fosInitTerminal(body, id);
-  else if(appName==='files') _fosInitFiles(body, id, opts.path||'');
-  else if(appName==='editor') _fosInitEditor(body, id, opts.path||'', opts.content);
-  else if(appName==='agent') _fosInitAgent(body, id);
-  else if(appName==='monitor') _fosInitMonitor(body, id);
-
-  _fosUpdateDock();
-  return id;
-}
-
-function fosFocusWin(id){
-  document.querySelectorAll('.fos-win').forEach(function(w){w.classList.remove('fos-focused');});
-  var w = _fos.windows[id]; if(!w) return;
-  w.el.classList.add('fos-focused');
-  w.el.style.zIndex = (++_fos.zTop);
-}
-
-function fosCloseWin(id){
-  var w = _fos.windows[id]; if(!w) return;
-  w.el.remove(); delete _fos.windows[id];
-  _fosUpdateDock();
-}
-
-function fosToggleMin(id){
-  var w = _fos.windows[id]; if(!w) return;
-  w.minimized = !w.minimized;
-  w.el.classList.toggle('fos-minimized', w.minimized);
-  _fosUpdateDock();
-}
-
-function fosToggleMax(id){
-  var w = _fos.windows[id]; if(!w) return;
-  var desktop = document.getElementById('fos-desktop');
-  if(!w.maximized){
-    w.prevRect = {x:w.el.offsetLeft, y:w.el.offsetTop, w:w.el.offsetWidth, h:w.el.offsetHeight};
-    w.el.style.left='4px'; w.el.style.top='4px';
-    w.el.style.width=(desktop.clientWidth-8)+'px'; w.el.style.height=(desktop.clientHeight-8)+'px';
-    w.maximized = true;
-  } else {
-    if(w.prevRect){
-      w.el.style.left=w.prevRect.x+'px'; w.el.style.top=w.prevRect.y+'px';
-      w.el.style.width=w.prevRect.w+'px'; w.el.style.height=w.prevRect.h+'px';
-    }
-    w.maximized = false;
-  }
-  fosFocusWin(id);
-}
-
-function _fosUpdateDock(){
-  var running = {};
-  for(var id in _fos.windows) running[_fos.windows[id].app] = true;
-  document.querySelectorAll('.fos-dock-btn').forEach(function(b){
-    b.classList.toggle('fos-running', !!running[b.dataset.app]);
-  });
-}
-
-function _fosMakeDraggable(win, id){
-  var bar = win.querySelector('.fos-titlebar');
-  var sx,sy,ox,oy,dragging=false;
-  bar.addEventListener('mousedown', function(e){
-    if(e.target.classList.contains('fos-tb')) return;
-    dragging=true; sx=e.clientX; sy=e.clientY;
-    ox=win.offsetLeft; oy=win.offsetTop;
-    document.body.style.userSelect='none';
-    fosFocusWin(id);
-  });
-  document.addEventListener('mousemove', function(e){
-    if(!dragging) return;
-    var nx = ox+(e.clientX-sx), ny = oy+(e.clientY-sy);
-    var desktop=document.getElementById('fos-desktop');
-    nx = Math.max(-win.offsetWidth+80, Math.min(desktop.clientWidth-40, nx));
-    ny = Math.max(0, Math.min(desktop.clientHeight-30, ny));
-    win.style.left = nx+'px'; win.style.top = ny+'px';
-  });
-  document.addEventListener('mouseup', function(){ dragging=false; document.body.style.userSelect=''; });
-}
-
-function _fosMakeResizable(win, id){
-  var handles = win.querySelectorAll('.fos-rz, .fos-resizer');
-  handles.forEach(function(h){
-    var dir = h.dataset.d || 'se';
-    var sx,sy,ox,oy,ow,oh,resizing=false;
-    h.addEventListener('mousedown', function(e){
-      resizing=true; sx=e.clientX; sy=e.clientY;
-      ox=win.offsetLeft; oy=win.offsetTop; ow=win.offsetWidth; oh=win.offsetHeight;
-      e.stopPropagation(); e.preventDefault();
-      document.body.style.userSelect='none';
-      fosFocusWin(id);
-    });
-    document.addEventListener('mousemove', function(e){
-      if(!resizing) return;
-      var dx=e.clientX-sx, dy=e.clientY-sy;
-      var nx=ox, ny=oy, nw=ow, nh=oh;
-      if(dir.indexOf('e')>=0) nw=Math.max(320, ow+dx);
-      if(dir.indexOf('s')>=0) nh=Math.max(200, oh+dy);
-      if(dir.indexOf('w')>=0){ nw=Math.max(320, ow-dx); nx=ox+(ow-nw); }
-      if(dir.indexOf('n')>=0){ nh=Math.max(200, oh-dy); ny=oy+(oh-nh); }
-      win.style.left=nx+'px'; win.style.top=ny+'px';
-      win.style.width=nw+'px'; win.style.height=nh+'px';
-    });
-    document.addEventListener('mouseup', function(){ resizing=false; document.body.style.userSelect=''; });
-  });
-}
-
-// ── API helper ───────────────────────────────────────────────────────────────
-async function _fosApi(ep, body){
-  var r = await apiFetch(ep, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-  return await r.json();
-}
-
-// ════════════════════ TERMINAL APP ════════════════════════════════════════
-function _fosInitTerminal(body, winId){
-  body.innerHTML =
-    '<div class="fos-term">'
-      +'<div class="fos-term-out" id="'+winId+'-out"><span class="fos-info">FusionOS Terminal — sandboxed Linux shell. Type \'help\' for tips.</span>\n\n</div>'
-      +'<div class="fos-term-row">'
-        +'<span class="fos-term-prompt" id="'+winId+'-prompt">~ $</span>'
-        +'<input class="fos-term-inp" id="'+winId+'-inp" autocomplete="off" spellcheck="false" placeholder="type a command…"/>'
-      +'</div>'
-    +'</div>';
-  var inp = document.getElementById(winId+'-inp');
-  var hist = []; var hidx = 0;
-  inp.addEventListener('keydown', async function(e){
-    if(e.key==='Enter'){
-      var cmd = inp.value; inp.value='';
-      if(!cmd.trim()) return;
-      hist.push(cmd); hidx=hist.length;
-      await _fosRunTermCmd(winId, cmd);
-    } else if(e.key==='ArrowUp'){
-      if(hidx>0){ hidx--; inp.value=hist[hidx]; setTimeout(function(){inp.setSelectionRange(99,99);},0); }
-      e.preventDefault();
-    } else if(e.key==='ArrowDown'){
-      if(hidx<hist.length-1){ hidx++; inp.value=hist[hidx]; } else { hidx=hist.length; inp.value=''; }
-      e.preventDefault();
-    }
-  });
-  setTimeout(function(){inp.focus();},100);
-}
-
-async function _fosRunTermCmd(winId, cmd){
-  var out = document.getElementById(winId+'-out');
-  if(!out) return;
-  var promptEl = document.getElementById(winId+'-prompt');
-  var curCwd = (promptEl.textContent.split(' $')[0]||'~').replace(/^~\/?/,'');
-  if(cmd.trim()==='help'){
-    out.innerHTML += '<span class="fos-cmd">$ '+escHtml(cmd)+'</span>\n'
-      +'<span class="fos-info">Real shell commands run in your sandboxed home dir.\nLanguages: python3, node, bash, curl, git, gcc/g++, pip, npm — all available.\nTry: ls, pwd, mkdir test, curl -s https://api.github.com/zen, python3 -c "print(2+2)", node -e "console.log(1+1)", pip install requests\nUse the AI Agent app for autonomous multi-step tasks.</span>\n\n';
-    out.scrollTop = out.scrollHeight; return;
-  }
-  out.innerHTML += '<span class="fos-cmd">$ '+escHtml(cmd)+'</span>\n';
-  out.scrollTop = out.scrollHeight;
-  try{
-    var d = await _fosApi('/api/fos/exec', {cmd: cmd, cwd: curCwd});
-    if(d.stdout==='__CLEAR__'){ out.innerHTML=''; return; }
-    if(d.stdout) out.innerHTML += '<span class="fos-ok">'+escHtml(d.stdout)+'</span>'+(d.stdout.endsWith('\n')?'':'\n');
-    if(d.stderr) out.innerHTML += '<span class="fos-err">'+escHtml(d.stderr)+'</span>'+(d.stderr.endsWith('\n')?'':'\n');
-    if(!d.stdout && !d.stderr) out.innerHTML += '\n';
-    promptEl.textContent = '~'+(d.cwd?'/'+d.cwd:'')+' $';
-  } catch(e){
-    out.innerHTML += '<span class="fos-err">Error: '+escHtml(e.message)+'</span>\n';
-  }
-  out.innerHTML += '\n';
-  out.scrollTop = out.scrollHeight;
-}
-
-// ════════════════════ FILES APP ═══════════════════════════════════════════
-async function _fosInitFiles(body, winId, startPath){
-  body.innerHTML =
-    '<div class="fos-files">'
-      +'<div class="fos-files-sb">'
-        +'<button class="fos-sb-btn" onclick="_fosFilesNav(\''+winId+'\',\'\')">🏠 Home</button>'
-        +'<button class="fos-sb-btn" onclick="_fosFilesNewFile(\''+winId+'\')">📄 New File</button>'
-        +'<button class="fos-sb-btn" onclick="_fosFilesNewFolder(\''+winId+'\')">📁 New Folder</button>'
-        +'<button class="fos-sb-btn" onclick="_fosFilesRefresh(\''+winId+'\')">🔄 Refresh</button>'
-      +'</div>'
-      +'<div class="fos-files-main">'
-        +'<div class="fos-files-bar"><span style="font-size:11px;color:rgba(255,255,255,.4)">📍</span><span id="'+winId+'-path" style="font-size:11px;color:rgba(255,255,255,.6);font-family:monospace">~</span></div>'
-        +'<div class="fos-files-list" id="'+winId+'-list"></div>'
-      +'</div>'
-    +'</div>';
-  _fos.windows[winId].curPath = startPath||'';
-  await _fosFilesNav(winId, startPath||'');
-}
-
-async function _fosFilesNav(winId, path){
-  var w = _fos.windows[winId]; if(!w) return;
-  w.curPath = path;
-  var d = await _fosApi('/api/fos/files', {action:'list', path: path});
-  var listEl = document.getElementById(winId+'-list');
-  var pathEl = document.getElementById(winId+'-path');
-  if(!listEl) return;
-  if(d.error){ listEl.innerHTML='<div style="padding:20px;color:var(--tx3);font-size:12px">'+escHtml(d.error)+'</div>'; return; }
-  pathEl.textContent = '~/'+(d.path||'');
-  var html = '';
-  if(path){
-    var parent = path.split('/').slice(0,-1).join('/');
-    html += '<div class="fos-fitem" onclick="_fosFilesNav(\''+winId+'\',\''+escHtml(parent)+'\')"><span>⬅</span><span class="fos-fname">.. (up)</span></div>';
-  }
-  if(d.items.length===0) html += '<div style="padding:16px;color:rgba(255,255,255,.25);font-size:11px;text-align:center">Empty folder</div>';
-  d.items.forEach(function(it){
-    var full = (path?path+'/':'')+it.name;
-    var icon = it.is_dir ? '📁' : _fosFileIcon(it.name);
-    var sizeStr = it.is_dir ? '' : _fosFmtSize(it.size);
-    html += '<div class="fos-fitem" oncontextmenu="_fosFileCtx(event,\''+winId+'\',\''+escHtml(full).replace(/'/g,"\\'")+'\',\''+(it.is_dir?'dir':'file')+'\');return false;" '
-      +'ondblclick="'+(it.is_dir?'_fosFilesNav(\''+winId+'\',\''+escHtml(full).replace(/'/g,"\\'")+'\')':'fosOpenApp(\'editor\',{forceNew:false,path:\''+escHtml(full).replace(/'/g,"\\'")+'\'})')+'">'
-      +'<span>'+icon+'</span><span class="fos-fname">'+escHtml(it.name)+'</span><span class="fos-fmeta">'+sizeStr+'</span></div>';
-  });
-  listEl.innerHTML = html;
-}
-function _fosFmtSize(b){ if(b<1024) return b+'B'; if(b<1048576) return (b/1024).toFixed(1)+'K'; return (b/1048576).toFixed(1)+'M'; }
-function _fosFileIcon(name){
-  var ext=(name.split('.').pop()||'').toLowerCase();
-  var m={py:'🐍',js:'📜',ts:'📘',html:'🌐',css:'🎨',json:'📋',md:'📄',txt:'📝',sh:'🦀',csv:'📊',yml:'⚙️',yaml:'⚙️',png:'🖼',jpg:'🖼',jpeg:'🖼',svg:'🖼',pdf:'📕',zip:'🗜'};
-  return m[ext]||'📄';
-}
-function _fosFilesRefresh(winId){ var w=_fos.windows[winId]; if(w) _fosFilesNav(winId, w.curPath||''); }
-async function _fosFilesNewFile(winId){
-  var w=_fos.windows[winId]; var name=prompt('New file name:','untitled.txt'); if(!name) return;
-  var path=(w.curPath?w.curPath+'/':'')+name;
-  await _fosApi('/api/fos/files',{action:'new_file',path:path});
-  _fosFilesRefresh(winId);
-}
-async function _fosFilesNewFolder(winId){
-  var w=_fos.windows[winId]; var name=prompt('New folder name:','new-folder'); if(!name) return;
-  var path=(w.curPath?w.curPath+'/':'')+name;
-  await _fosApi('/api/fos/files',{action:'mkdir',path:path});
-  _fosFilesRefresh(winId);
-}
-function _fosFileCtx(e, winId, path, kind){
-  document.querySelectorAll('.fos-ctx').forEach(function(c){c.remove();});
-  var menu=document.createElement('div'); menu.className='fos-ctx';
-  menu.style.left=e.clientX+'px'; menu.style.top=e.clientY+'px';
-  var items=[];
-  if(kind==='file') items.push(['✏️ Open in Editor', 'fosOpenApp(\'editor\',{forceNew:false,path:\''+path.replace(/'/g,"\\'")+'\'});']);
-  items.push(['✏️ Rename', '_fosFileRename(\''+winId+'\',\''+path.replace(/'/g,"\\'")+'\');']);
-  items.push(['🗑 Delete', '_fosFileDelete(\''+winId+'\',\''+path.replace(/'/g,"\\'")+'\');']);
-  items.forEach(function(it){
-    var d=document.createElement('div'); d.className='fos-ctx-item'; d.textContent=it[0];
-    d.onclick=function(){ menu.remove(); eval(it[1]); };
-    menu.appendChild(d);
-  });
-  document.body.appendChild(menu);
-  setTimeout(function(){document.addEventListener('click',function h(){menu.remove();document.removeEventListener('click',h);});},10);
-}
-async function _fosFileRename(winId, path){
-  var base=path.split('/').pop(); var nn=prompt('Rename to:', base); if(!nn) return;
-  var parent=path.split('/').slice(0,-1).join('/');
-  var newPath=(parent?parent+'/':'')+nn;
-  await _fosApi('/api/fos/files',{action:'rename',path:path,new_path:newPath});
-  _fosFilesRefresh(winId);
-}
-async function _fosFileDelete(winId, path){
-  if(!confirm('Delete "'+path+'"? This cannot be undone.')) return;
-  await _fosApi('/api/fos/files',{action:'delete',path:path});
-  _fosFilesRefresh(winId);
-}
-
-// ════════════════════ EDITOR APP ══════════════════════════════════════════
-async function _fosInitEditor(body, winId, path, initialContent){
-  body.innerHTML =
-    '<div class="fos-editor">'
-      +'<div class="fos-editor-bar">'
-        +'<input id="'+winId+'-fname" placeholder="filename.py" style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:4px 8px;color:#d8e8f8;font-size:11px;font-family:monospace;width:200px" value="'+escHtml(path||'')+'"/>'
-        +'<button onclick="_fosEditorSave(\''+winId+'\')" style="background:rgba(74,158,255,.18);border:1px solid rgba(74,158,255,.35);border-radius:6px;padding:4px 12px;color:#7ec3ff;font-size:11px;font-weight:600;cursor:pointer">💾 Save</button>'
-        +'<button onclick="_fosEditorRun(\''+winId+'\')" style="background:rgba(78,230,120,.15);border:1px solid rgba(78,230,120,.32);border-radius:6px;padding:4px 12px;color:#7ee8a2;font-size:11px;font-weight:600;cursor:pointer">▶ Run</button>'
-        +'<span id="'+winId+'-savestatus" style="font-size:10px;color:rgba(255,255,255,.3);margin-left:auto"></span>'
-      +'</div>'
-      +'<textarea class="fos-editor-ta" id="'+winId+'-ta" spellcheck="false" placeholder="Start typing, or open a file from Files app…"></textarea>'
-      +'<div class="fos-statusbar"><span style="font-size:10px;color:rgba(255,255,255,.3)" id="'+winId+'-status">Ready</span></div>'
-    +'</div>';
-  if(path){
-    var d = await _fosApi('/api/fos/files',{action:'read', path:path});
-    document.getElementById(winId+'-ta').value = d.content!=null ? d.content : '';
-    document.getElementById(winId+'-status').textContent = path;
-  } else if(initialContent!=null){
-    document.getElementById(winId+'-ta').value = initialContent;
-  }
-}
-async function _fosEditorSave(winId){
-  var path = document.getElementById(winId+'-fname').value.trim();
-  if(!path){ showToast('Enter a filename first'); return; }
-  var content = document.getElementById(winId+'-ta').value;
-  var st = document.getElementById(winId+'-savestatus');
-  st.textContent='Saving…';
-  await _fosApi('/api/fos/files',{action:'write',path:path,content:content});
-  st.textContent='✅ Saved '+new Date().toLocaleTimeString();
-  document.getElementById(winId+'-status').textContent = path;
-}
-async function _fosEditorRun(winId){
-  var path = document.getElementById(winId+'-fname').value.trim();
-  if(!path){ showToast('Save the file with a name first (e.g. script.py)'); return; }
-  await _fosEditorSave(winId);
-  var runners = {py:'python3', js:'node', sh:'bash', rb:'ruby', php:'php', pl:'perl', go:'go run', c:'gcc -o /tmp/_a.out $f && /tmp/_a.out', cpp:'g++ -o /tmp/_a.out $f && /tmp/_a.out'};
-  var ext = path.split('.').pop();
-  var runner = runners[ext];
-  if(!runner){ showToast('Don\'t know how to run .'+ext+' files'); return; }
-  var termId = fosOpenApp('terminal');
-  setTimeout(async function(){
-    var inp = document.getElementById(termId+'-inp');
-    if(inp){
-      var rcmd = runner.indexOf('$f')>=0 ? runner.replace(/\$f/g, "'"+path+"'") : (runner+" '"+path+"'");
-      await _fosRunTermCmd(termId, rcmd);
-    }
-  }, 250);
-}
-
-// ════════════════════ AI AGENT APP ═════════════════════════════════════════
-async function _fosInitAgent(body, winId){
-  body.innerHTML =
-    '<div class="fos-agent">'
-      +'<div class="fos-agent-log" id="'+winId+'-log">'
-        +'<div style="padding:16px;text-align:center;color:rgba(255,255,255,.3);font-size:12px">🤖 Give me a task and I\'ll plan & run real commands to complete it autonomously.</div>'
-      +'</div>'
-      +'<div class="fos-agent-footer">'
-        +'<textarea id="'+winId+'-goal" rows="2" placeholder="e.g. write a python script that scrapes nothing but generates 10 random passwords and saves them to passwords.txt"'
-          +' style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 10px;color:#d8e8f8;font-size:12px;resize:none;outline:none"></textarea>'
-        +'<button id="'+winId+'-run" onclick="_fosAgentRun(\''+winId+'\')" style="background:linear-gradient(135deg,#4a9eff,#a855f7);border:none;border-radius:8px;padding:9px;color:#fff;font-size:12px;font-weight:700;cursor:pointer">✨ Run Agent</button>'
-      +'</div>'
-    +'</div>';
-}
-
-async function _fosAgentRun(winId){
-  var goalEl = document.getElementById(winId+'-goal');
-  var goal = goalEl.value.trim();
-  if(!goal){ showToast('Describe a task first'); return; }
-  var log = document.getElementById(winId+'-log');
-  var btn = document.getElementById(winId+'-run');
-  log.innerHTML = '<div class="fos-step" style="border-color:rgba(168,85,247,.3)"><b style="color:#c084fc">🎯 Goal:</b> '+escHtml(goal)+'</div>';
-  btn.disabled = true; btn.textContent = '⏳ Working…';
-  goalEl.disabled = true;
-  var transcript = [];
-  var stepNum = 1;
-  var maxSteps = 14;
-  try{
-    while(stepNum <= maxSteps){
-      var stepDiv = document.createElement('div');
-      stepDiv.className = 'fos-step';
-      stepDiv.innerHTML = '<span class="fos-info">🧠 Planning step '+stepNum+'…</span>';
-      log.appendChild(stepDiv); log.scrollTop = log.scrollHeight;
-
-      var d = await _fosApi('/api/fos/agent', {goal: goal, transcript: transcript, step: stepNum});
-
-      if(d.action === 'run'){
-        stepDiv.classList.add(d.code===0 ? 'fos-step-ok' : 'fos-step-err');
-        stepDiv.innerHTML =
-          '<div style="color:rgba(255,255,255,.55);margin-bottom:4px;font-size:11px">'+(d.explain?'💭 '+escHtml(d.explain):'Step '+stepNum)+'</div>'
-          +'<div class="fos-step-cmd">$ '+escHtml(d.cmd)+'</div>'
-          +(d.stdout?'<div class="fos-step-out">'+escHtml(d.stdout)+'</div>':'')
-          +(d.stderr?'<div class="fos-step-out" style="color:#ff8585">'+escHtml(d.stderr)+'</div>':'');
-        transcript.push({cmd:d.cmd, stdout:d.stdout, stderr:d.stderr, code:d.code});
-        stepNum++;
-        log.scrollTop = log.scrollHeight;
-        await new Promise(function(r){setTimeout(r,250);});
-      } else if(d.action === 'done'){
-        stepDiv.classList.add('fos-step-ok');
-        stepDiv.innerHTML = '<div style="color:#7ee8a2;font-weight:600;margin-bottom:3px">✅ Done</div><div style="color:rgba(255,255,255,.75)">'+escHtml(d.summary||'Task completed.')+'</div>';
-        log.scrollTop = log.scrollHeight;
-        break;
-      } else {
-        stepDiv.classList.add('fos-step-err');
-        stepDiv.innerHTML = '<div style="color:#ff8585;font-weight:600;margin-bottom:3px">⚠️ Stopped</div><div style="color:rgba(255,255,255,.6)">'+escHtml(d.reason||'Agent could not continue.')+'</div>';
-        log.scrollTop = log.scrollHeight;
-        break;
-      }
-    }
-  } catch(e){
-    var errDiv=document.createElement('div'); errDiv.className='fos-step fos-step-err';
-    errDiv.innerHTML='❌ '+escHtml(e.message); log.appendChild(errDiv);
-  }
-  btn.disabled = false; btn.textContent = '✨ Run Agent';
-  goalEl.disabled = false;
-}
-
-// ════════════════════ MONITOR APP ═══════════════════════════════════════════
-async function _fosInitMonitor(body, winId){
-  body.innerHTML = '<div class="fos-monitor" id="'+winId+'-mon"><div style="text-align:center;color:rgba(255,255,255,.3);padding:30px;font-size:12px">Loading stats…</div></div>';
-  await _fosRefreshMonitor(winId);
-  var timer = setInterval(function(){
-    if(!_fos.windows[winId]){ clearInterval(timer); return; }
-    _fosRefreshMonitor(winId);
-  }, 4000);
-}
-async function _fosRefreshMonitor(winId){
-  var el = document.getElementById(winId+'-mon'); if(!el) return;
-  try{
-    var d = await _fosApi('/api/fos/stats', {});
-    var models = d.models_online||{};
-    var modelRows = Object.keys(models).map(function(k){
-      return '<div style="display:flex;justify-content:space-between;font-size:11px;padding:2px 0"><span style="color:rgba(255,255,255,.55)">'+k+'</span><span style="color:'+(models[k]?'#7ee8a2':'#ff8585')+'">'+(models[k]?'● online':'○ offline')+'</span></div>';
-    }).join('');
-    el.innerHTML =
-      '<div class="fos-mon-grid">'
-        +'<div class="fos-mon-card"><div class="fos-mon-lbl">Sandbox Files</div><div class="fos-mon-val">'+d.sandbox_files+' files</div></div>'
-        +'<div class="fos-mon-card"><div class="fos-mon-lbl">Sandbox Size</div><div class="fos-mon-val">'+d.sandbox_size_kb+' KB</div></div>'
-        +'<div class="fos-mon-card"><div class="fos-mon-lbl">Python</div><div class="fos-mon-val">v'+d.python_version+'</div></div>'
-        +'<div class="fos-mon-card"><div class="fos-mon-lbl">Uptime</div><div class="fos-mon-val">'+Math.floor(d.server_uptime_s/60)+'m '+Math.floor(d.server_uptime_s%60)+'s</div></div>'
-      +'</div>'
-      +'<div class="fos-mon-card"><div class="fos-mon-lbl">Platform</div><div class="fos-mon-val" style="font-size:10px">'+escHtml(d.platform||'')+'</div></div>'
-      +(d.disk_total_gb?'<div class="fos-mon-card"><div class="fos-mon-lbl">Disk</div><div class="fos-mon-val">'+d.disk_used_gb+'GB / '+d.disk_total_gb+'GB used</div></div>':'')
-      +'<div class="fos-mon-card"><div class="fos-mon-lbl">AI Models Online</div>'+modelRows+'</div>';
-  }catch(e){}
-}
-
 // ══ File Creator Modal ═════════════════════════════════════════════════════
 var _FILE_TYPES=[
   // Documents
@@ -8045,155 +7140,66 @@ var _FILE_TYPES=[
   {icon:'📑',name:'Word Doc',     ext:'docx',    cat:'Docs',   binary:true,  prompt:'a professional document with structured headings, paragraphs, bullet lists, and tables (in markdown format for conversion)'},
   {icon:'📋',name:'Report',       ext:'md',      cat:'Docs',   binary:false, prompt:'a detailed professional report with executive summary, methodology, findings, data analysis, conclusions, and recommendations'},
   {icon:'📝',name:'Plain Text',   ext:'txt',     cat:'Docs',   binary:false, prompt:'plain text formatted content, clearly organized with spacing and separators'},
-  {icon:'📧',name:'Email Draft',  ext:'md',      cat:'Docs',   binary:false, prompt:'a professional email with subject, greeting, body paragraphs, and signature — ready to send'},
-  {icon:'📃',name:'Cover Letter', ext:'md',      cat:'Docs',   binary:false, prompt:'a professional, compelling cover letter with proper structure and formatting'},
-  {icon:'📰',name:'Press Release',ext:'md',      cat:'Docs',   binary:false, prompt:'a professional press release with headline, dateline, body paragraphs, boilerplate, and contact info'},
   // Spreadsheets & Data
   {icon:'📊',name:'Excel (.xlsx)',ext:'xlsx',    cat:'Data',   binary:true,  prompt:'CSV data with a descriptive header row and at least 25 rows of realistic, diverse data'},
   {icon:'📊',name:'CSV Dataset',  ext:'csv',     cat:'Data',   binary:false, prompt:'CSV data with a clear header row and at least 25 rows of realistic, varied, detailed data'},
   {icon:'📋',name:'JSON Data',    ext:'json',    cat:'Data',   binary:false, prompt:'well-structured valid JSON data, properly formatted and indented with realistic values'},
   {icon:'⚙️',name:'YAML Config', ext:'yaml',    cat:'Data',   binary:false, prompt:'valid, well-structured YAML configuration or dataset'},
   {icon:'📰',name:'XML',          ext:'xml',     cat:'Data',   binary:false, prompt:'valid, well-formed XML data with proper nesting and realistic values'},
-  {icon:'🗃',name:'SQLite Schema',ext:'sql',     cat:'Data',   binary:false, prompt:'SQL schema with CREATE TABLE, indexes, foreign keys, and 20+ INSERT rows of realistic data'},
-  {icon:'🔷',name:'GraphQL Schema',ext:'graphql',cat:'Data',  binary:false, prompt:'complete GraphQL schema with types, queries, mutations, and subscriptions'},
   // Presentations
-  {icon:'🎯',name:'PowerPoint',   ext:'pptx.md', cat:'Present',binary:true,  prompt:'presentation slides — use # Title for each slide title, --- to separate slides, and bullet points for content. Include at least 10 slides with rich content.'},
-  {icon:'🖥',name:'Reveal.js',    ext:'html',    cat:'Present',binary:false,  prompt:'a complete Reveal.js HTML presentation with dark theme, multiple slides, code blocks, and smooth animations. Self-contained single HTML file.'},
+  {icon:'🎯',name:'PowerPoint',   ext:'pptx.md', cat:'Present',binary:true,  prompt:'presentation slides — use # Title for each slide title, --- to separate slides, and bullet points for content. Include at least 8 slides.'},
   // Web & UI
   {icon:'🌐',name:'HTML Page',    ext:'html',    cat:'Web',    binary:false, prompt:'a complete, self-contained, beautifully styled HTML page with inline CSS and JavaScript, responsive design'},
-  {icon:'⚛',name:'React Component',ext:'jsx',   cat:'Web',    binary:false, prompt:'a complete, modern React functional component with hooks, props, and inline styles or Tailwind classes'},
-  {icon:'💚',name:'Vue Component', ext:'vue',    cat:'Web',    binary:false, prompt:'a complete Vue 3 single-file component with <template>, <script setup>, and <style>'},
-  {icon:'🔥',name:'Svelte Component',ext:'svelte',cat:'Web',  binary:false, prompt:'a complete Svelte component with reactivity, event handling, and scoped styles'},
   {icon:'🎨',name:'CSS Styles',   ext:'css',     cat:'Web',    binary:false, prompt:'complete, well-organized CSS stylesheet with variables, responsive breakpoints, and modern design'},
-  {icon:'💅',name:'SCSS/Sass',    ext:'scss',    cat:'Web',    binary:false, prompt:'complete SCSS stylesheet with variables, mixins, nesting, and responsive breakpoints'},
   {icon:'📜',name:'JavaScript',   ext:'js',      cat:'Web',    binary:false, prompt:'complete, well-commented, modern JavaScript code with error handling'},
-  {icon:'📘',name:'TypeScript',   ext:'ts',      cat:'Web',    binary:false, prompt:'complete, typed TypeScript code with interfaces, types, enums, and proper annotations'},
-  {icon:'🔷',name:'Next.js Page', ext:'tsx',     cat:'Web',    binary:false, prompt:'a complete Next.js page component with TypeScript, data fetching, and proper exports'},
+  {icon:'📜',name:'TypeScript',   ext:'ts',      cat:'Web',    binary:false, prompt:'complete, typed TypeScript code with interfaces, types, and proper annotations'},
   // Backend Code
   {icon:'🐍',name:'Python',       ext:'py',      cat:'Code',   binary:false, prompt:'complete, well-commented, runnable Python code with docstrings and error handling'},
-  {icon:'🦀',name:'Rust',         ext:'rs',      cat:'Code',   binary:false, prompt:'complete, idiomatic Rust code with proper ownership, error handling with Result/Option, and comments'},
-  {icon:'🐹',name:'Go',           ext:'go',      cat:'Code',   binary:false, prompt:'complete, idiomatic Go code with proper package structure, error handling, and comments'},
-  {icon:'☕',name:'Java',         ext:'java',    cat:'Code',   binary:false, prompt:'complete Java class with proper structure, generics, comments, and best practices'},
-  {icon:'🔷',name:'C#',           ext:'cs',      cat:'Code',   binary:false, prompt:'complete C# class with proper namespace, using statements, XML docs, and modern C# patterns'},
+  {icon:'🗄',name:'SQL',          ext:'sql',     cat:'Code',   binary:false, prompt:'SQL script with CREATE TABLE statements, indexes, constraints, and INSERT data rows'},
+  {icon:'🦀',name:'Bash Script',  ext:'sh',      cat:'Code',   binary:false, prompt:'complete bash shell script with shebang, comments, and error handling'},
+  {icon:'🐹',name:'Go',           ext:'go',      cat:'Code',   binary:false, prompt:'complete, idiomatic Go code with proper package structure and error handling'},
+  {icon:'☕',name:'Java',         ext:'java',    cat:'Code',   binary:false, prompt:'complete Java class with proper structure, comments, and best practices'},
   {icon:'🔧',name:'C/C++',        ext:'cpp',     cat:'Code',   binary:false, prompt:'complete, well-commented C++ code with proper includes and main function'},
-  {icon:'🍎',name:'Swift',        ext:'swift',   cat:'Code',   binary:false, prompt:'complete Swift code with proper Swift idioms, optionals, and comments'},
-  {icon:'🤖',name:'Kotlin',       ext:'kt',      cat:'Code',   binary:false, prompt:'complete Kotlin code with data classes, extension functions, and idiomatic patterns'},
-  {icon:'🎯',name:'Dart/Flutter', ext:'dart',    cat:'Code',   binary:false, prompt:'complete Dart/Flutter widget code with proper StatefulWidget or StatelessWidget structure'},
   {icon:'💎',name:'Ruby',         ext:'rb',      cat:'Code',   binary:false, prompt:'complete, idiomatic Ruby code with comments'},
   {icon:'🐘',name:'PHP',          ext:'php',     cat:'Code',   binary:false, prompt:'complete PHP script with proper structure and comments'},
-  {icon:'🦀',name:'Bash Script',  ext:'sh',      cat:'Code',   binary:false, prompt:'complete bash shell script with shebang, comments, and error handling'},
-  {icon:'📊',name:'R Script',     ext:'r',       cat:'Code',   binary:false, prompt:'complete R script with data analysis, ggplot2 visualizations, and comments'},
-  {icon:'📓',name:'Jupyter Notebook',ext:'ipynb',cat:'Code',  binary:false, prompt:'complete Jupyter notebook in JSON format with markdown cells and Python code cells with outputs'},
-  {icon:'🗄',name:'SQL Script',   ext:'sql',     cat:'Code',   binary:false, prompt:'SQL script with CREATE TABLE statements, indexes, stored procedures, and INSERT data rows'},
-  // DevOps & Config
-  {icon:'🐳',name:'Dockerfile',   ext:'dockerfile',cat:'DevOps',binary:false,prompt:'a production-ready Dockerfile with multi-stage build, proper base image, and security best practices'},
-  {icon:'🔄',name:'docker-compose',ext:'yml',   cat:'DevOps', binary:false, prompt:'a complete docker-compose.yml with services, volumes, networks, environment variables, and health checks'},
-  {icon:'⚡',name:'GitHub Actions',ext:'yml',   cat:'DevOps', binary:false, prompt:'a complete GitHub Actions workflow YAML with triggers, jobs, steps, and caching'},
-  {icon:'🌿',name:'Terraform',    ext:'tf',      cat:'DevOps', binary:false, prompt:'complete Terraform HCL configuration with providers, resources, variables, and outputs'},
-  {icon:'⚙️',name:'TOML Config', ext:'toml',    cat:'DevOps', binary:false, prompt:'valid TOML configuration file with sections, comments, and realistic values'},
-  {icon:'⚙️',name:'ENV File',    ext:'env',     cat:'DevOps', binary:false, prompt:'environment variables .env file with comments explaining each variable and example values'},
-  {icon:'🌐',name:'Nginx Config', ext:'conf',   cat:'DevOps', binary:false, prompt:'complete Nginx server configuration with virtual hosts, SSL, reverse proxy, gzip, and caching headers'},
-  {icon:'📋',name:'Makefile',     ext:'makefile',cat:'DevOps',binary:false, prompt:'a complete Makefile with common build, test, lint, and deploy targets with comments'},
+  // Config
+  {icon:'⚙️',name:'TOML Config', ext:'toml',    cat:'Config', binary:false, prompt:'valid TOML configuration file with sections, comments, and realistic values'},
+  {icon:'⚙️',name:'ENV File',    ext:'env',     cat:'Config', binary:false, prompt:'environment variables .env file with comments explaining each variable'},
 ];
 // Group by category
-var _FILE_CATS=['Docs','Data','Present','Web','Code','DevOps'];
-
-var _PPT_THEMES=[
-  {id:'dark',      label:'Dark Navy',      desc:'Deep navy with blue accents'},
-  {id:'light',     label:'Clean White',    desc:'Crisp white professional'},
-  {id:'ocean',     label:'Ocean Blue',     desc:'Deep ocean teal & blue'},
-  {id:'forest',    label:'Forest Green',   desc:'Rich green nature theme'},
-  {id:'sunset',    label:'Sunset Fire',    desc:'Orange-red gradient warmth'},
-  {id:'corporate', label:'Corporate',      desc:'Classic business blue'},
-  {id:'midnight',  label:'Midnight',       desc:'Pure black premium look'},
-  {id:'berry',     label:'Berry & Cream',  desc:'Rich purple with cream'},
-  {id:'terracotta',label:'Terracotta',     desc:'Warm earth tones'},
-  {id:'teal',      label:'Teal Trust',     desc:'Seafoam & teal modern'},
-  {id:'cherry',    label:'Cherry Bold',    desc:'Cherry red high contrast'},
-  {id:'sage',      label:'Sage Calm',      desc:'Soft green natural calm'},
-];
-var _PPT_ASPECTS=[
-  {id:'169',  label:'16:9 Standard',  desc:'Most common (1920×1080)'},
-  {id:'1610', label:'16:10 Widescreen',desc:'Slightly taller (1920×1200)'},
-  {id:'43',   label:'4:3 Classic',    desc:'Traditional square-ish'},
-];
-var _selectedPptTheme='dark', _selectedPptAspect='169';
+var _FILE_CATS=['Docs','Data','Present','Web','Code','Config'];
 
 var _selectedFileType=null;
-var _fileGridBuilt=false;
 
 function openFileCreator(){
-  if(!_fileGridBuilt){
-    _fileGridBuilt=true;
-    var grid=document.getElementById('fileTypeGrid');
+  var grid=document.getElementById('fileTypeGrid');
+  if(grid&&grid.children.length===0){
+    // Build categorized grid
     _FILE_CATS.forEach(function(cat){
       var catDiv=document.createElement('div');
-      catDiv.style.cssText='grid-column:1/-1;font-size:9px;font-weight:700;letter-spacing:1.2px;color:rgba(80,130,200,.65);text-transform:uppercase;padding:8px 4px 2px;margin-top:6px;border-top:1px solid rgba(60,100,180,.12)';
+      catDiv.style.cssText='grid-column:1/-1;font-size:9px;font-weight:700;letter-spacing:1.2px;color:rgba(80,120,200,.6);text-transform:uppercase;padding:8px 4px 2px;margin-top:4px';
       catDiv.textContent=cat;
       grid.appendChild(catDiv);
       _FILE_TYPES.forEach(function(ft,i){
         if(ft.cat!==cat) return;
         var card=document.createElement('div');
         card.className='ftype-card';
-        card.dataset.ftidx=String(i);
-        var badge=ft.binary?'<span style="font-size:8px;background:rgba(26,110,245,.18);border:1px solid rgba(26,110,245,.3);border-radius:3px;padding:1px 4px;color:#80c0ff;display:block;margin-top:3px">Real '+ft.ext.replace('pptx.md','pptx').toUpperCase()+'</span>':'';
+        card.dataset.idx=i;
+        var badge=ft.binary?'<span style="font-size:8px;background:rgba(26,110,245,.2);border:1px solid rgba(26,110,245,.3);border-radius:3px;padding:1px 4px;color:#80c0ff;display:block;margin-top:2px">Real '+ft.ext.replace('pptx.md','pptx').toUpperCase()+'</span>':'';
         card.innerHTML='<div class="ftype-card-icon">'+ft.icon+'</div><div class="ftype-card-name">'+ft.name+'</div><div class="ftype-card-ext">.'+ft.ext.replace('pptx.md','pptx')+'</div>'+badge;
-        card.addEventListener('click',function(){
+        card.onclick=function(){
           document.querySelectorAll('.ftype-card').forEach(function(c){c.classList.remove('selected');});
           card.classList.add('selected');
-          _selectedFileType=parseInt(card.dataset.ftidx,10);
+          _selectedFileType=i;
           document.getElementById('fileTopicInput').placeholder='Describe your '+ft.name.toLowerCase()+'…';
-          document.getElementById('pptOptions').style.display=(ft.ext==='pptx.md')?'block':'none';
-        });
+        };
         grid.appendChild(card);
       });
     });
-    // Build PPT options panel
-    var optsDiv=document.getElementById('pptOptions');
-    optsDiv.innerHTML='';
-    var tg=document.createElement('div');
-    tg.innerHTML='<div style="font-size:9px;font-weight:700;letter-spacing:1px;color:rgba(100,160,255,.75);text-transform:uppercase;margin-bottom:7px;margin-top:12px">🎨 Theme</div>';
-    var tgGrid=document.createElement('div');
-    tgGrid.style.cssText='display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px;margin-bottom:12px';
-    _PPT_THEMES.forEach(function(t){
-      var tc=document.createElement('div');
-      tc.dataset.tid=t.id;
-      tc.style.cssText='padding:7px 9px;border-radius:8px;border:1.5px solid rgba(60,100,180,.22);cursor:pointer;transition:all .15s;background:rgba(255,255,255,.04)';
-      tc.innerHTML='<div style="font-size:11px;font-weight:600;color:var(--tx)">'+(t.swatch||'')+(t.swatch?' ':'')+t.label+'</div><div style="font-size:9px;color:var(--tx3);margin-top:1px">'+t.desc+'</div>';
-      if(t.id===_selectedPptTheme) tc.style.cssText+=';border-color:var(--blue);background:rgba(26,110,245,.1)';
-      tc.addEventListener('click',function(){
-        _selectedPptTheme=t.id;
-        tgGrid.querySelectorAll('[data-tid]').forEach(function(x){x.style.borderColor='rgba(60,100,180,.22)';x.style.background='rgba(255,255,255,.04)';});
-        tc.style.borderColor='var(--blue)'; tc.style.background='rgba(26,110,245,.1)';
-      });
-      tgGrid.appendChild(tc);
-    });
-    tg.appendChild(tgGrid);
-    var ar=document.createElement('div');
-    ar.innerHTML='<div style="font-size:9px;font-weight:700;letter-spacing:1px;color:rgba(100,160,255,.75);text-transform:uppercase;margin-bottom:7px">📐 Aspect Ratio</div>';
-    var arRow=document.createElement('div');
-    arRow.style.cssText='display:flex;gap:7px;flex-wrap:wrap';
-    _PPT_ASPECTS.forEach(function(a){
-      var ac=document.createElement('div');
-      ac.dataset.aid=a.id;
-      ac.style.cssText='padding:7px 14px;border-radius:8px;border:1.5px solid rgba(60,100,180,.22);cursor:pointer;transition:all .15s;font-size:11px;font-weight:600;color:var(--tx);background:rgba(255,255,255,.04)';
-      ac.innerHTML=a.label+'<div style="font-size:9px;color:var(--tx3);font-weight:400;margin-top:1px">'+a.desc+'</div>';
-      if(a.id===_selectedPptAspect) ac.style.cssText+=';border-color:var(--blue);background:rgba(26,110,245,.1)';
-      ac.addEventListener('click',function(){
-        _selectedPptAspect=a.id;
-        arRow.querySelectorAll('[data-aid]').forEach(function(x){x.style.borderColor='rgba(60,100,180,.22)';x.style.background='rgba(255,255,255,.04)';});
-        ac.style.borderColor='var(--blue)'; ac.style.background='rgba(26,110,245,.1)';
-      });
-      arRow.appendChild(ac);
-    });
-    ar.appendChild(arRow);
-    optsDiv.appendChild(tg); optsDiv.appendChild(ar);
   }
-  // Reset state each open
   _selectedFileType=null;
   document.querySelectorAll('.ftype-card').forEach(function(c){c.classList.remove('selected');});
   document.getElementById('fileTopicInput').value='';
-  document.getElementById('pptOptions').style.display='none';
   document.getElementById('fileModalOverlay').classList.remove('hidden');
   setTimeout(function(){document.getElementById('fileTopicInput').focus();},200);
 }
@@ -8209,22 +7215,10 @@ function submitFileCreator(){
   if(!topic){showToast('Enter a topic or description');return;}
   var ft=_FILE_TYPES[_selectedFileType];
   var fnBase=topic.replace(/[^a-z0-9 ]/gi,'').trim().replace(/ +/g,'_').toLowerCase().slice(0,45)||'file';
-  var ext=ft.ext;
-  // Inject PPT theme/aspect into prompt for pptx files
-  var extraHint='';
-  if(ext==='pptx.md'){
-    var thmObj=_PPT_THEMES.find(function(t){return t.id===_selectedPptTheme;})||_PPT_THEMES[0];
-    var aspObj=_PPT_ASPECTS.find(function(a){return a.id===_selectedPptAspect;})||_PPT_ASPECTS[0];
-    fnBase=fnBase.replace('.pptx.md','');
-    extraHint=' [PPT theme: '+thmObj.label+', aspect: '+aspObj.label+']';
-    // store for the gen_pptx API call
-    window._pendingPptTheme=_selectedPptTheme;
-    window._pendingPptAspect=_selectedPptAspect;
-  }
-  var fname=fnBase+'.'+ext;
+  var fname=fnBase+'.'+ft.ext;
   closeFileCreator();
-  var prompt='Create '+ft.prompt+' about: '+topic+extraHint
-    +'\n\n[SYSTEM: Wrap ENTIRE content EXACTLY as:\n<<<FUSIONFILE:'+fname+'>>>\n[content]\n<<<END_FUSIONFILE>>>\nRules: (1) Nothing outside the markers. (2) Complete and production-ready — zero placeholders. (3) For CSV/xlsx: 25+ rows. (4) For pptx.md slides: 10+ slides with --- separator, rich bullet content per slide. (5) For code: fully runnable.]';
+  var prompt='Create '+ft.prompt+' about: '+topic
+    +'\n\n[SYSTEM: Wrap ENTIRE content EXACTLY as:\n<<<FUSIONFILE:'+fname+'>>>\n[content]\n<<<END_FUSIONFILE>>>\nRules: (1) Nothing outside the markers. (2) Complete and production-ready — zero placeholders. (3) For CSV/xlsx: 25+ rows. (4) For pptx.md slides: 8+ slides with --- separator. (5) For code: fully runnable.]';
   var inp=document.getElementById('msgIn');
   inp.value=prompt;
   sendMsg();
@@ -8905,6 +7899,521 @@ document.addEventListener('keydown',function(e){
 });
 
 </script>
+
+<style>
+/* ═══ FusionOS + Computer + SVG modal shared ═══════════════════════════════ */
+.modal-overlay{position:fixed;inset:0;z-index:9000;background:rgba(2,4,12,.82);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}
+.modal-overlay.hidden{display:none}
+.comp-chip{background:rgba(26,110,245,.12);border:1px solid rgba(26,110,245,.25);border-radius:20px;padding:4px 11px;font-size:11px;color:var(--tx2);cursor:pointer;transition:all .14s;white-space:nowrap}
+.comp-chip:hover{background:rgba(26,110,245,.22);color:var(--tx)}
+/* ═══ FusionOS desktop ══════════════════════════════════════════════════════ */
+#fos-overlay{position:fixed;inset:0;z-index:9500;display:none;flex-direction:column;background:#050710;font-family:'Segoe UI',system-ui,sans-serif}
+#fos-overlay.fos-on{display:flex}
+#fos-bar{height:26px;background:rgba(6,8,18,.96);backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,255,255,.055);display:flex;align-items:center;padding:0 10px;gap:0;flex-shrink:0;user-select:none}
+.fosb-logo{font-size:12px;font-weight:800;background:linear-gradient(120deg,#4a9eff,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-right:14px;cursor:pointer;letter-spacing:.3px}
+.fosb-item{font-size:11px;color:rgba(255,255,255,.65);padding:2px 9px;border-radius:5px;cursor:pointer;transition:background .1s}
+.fosb-item:hover{background:rgba(255,255,255,.1);color:#fff}
+.fosb-right{margin-left:auto;display:flex;align-items:center;gap:12px}
+.fosb-clock{font-size:11px;color:rgba(255,255,255,.45);font-variant-numeric:tabular-nums}
+#fos-desktop{flex:1;position:relative;overflow:hidden;background:radial-gradient(ellipse at 28% 22%,#0c1840 0%,#04060f 60%,#000 100%)}
+#fos-desktop::before{content:'';position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.025) 1px,transparent 1px);background-size:28px 28px;pointer-events:none}
+#fos-dock{height:62px;background:rgba(6,8,18,.9);backdrop-filter:blur(28px);border-top:1px solid rgba(255,255,255,.055);display:flex;align-items:center;justify-content:center;gap:4px;padding:0 16px;flex-shrink:0}
+.fos-dck{display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;padding:5px 9px;border-radius:11px;transition:all .15s;border:none;background:none;position:relative}
+.fos-dck:hover{background:rgba(255,255,255,.08);transform:translateY(-4px)}
+.fos-dck-ico{font-size:24px;transition:transform .15s}
+.fos-dck:hover .fos-dck-ico{transform:scale(1.18)}
+.fos-dck-lbl{font-size:9px;color:rgba(255,255,255,.4);white-space:nowrap}
+.fos-dck-dot{position:absolute;bottom:2px;left:50%;transform:translateX(-50%);width:4px;height:4px;border-radius:50%;background:#4a9eff;display:none}
+.fos-dck.fos-running .fos-dck-dot{display:block}
+/* Windows */
+.fos-win{position:absolute;background:rgba(10,14,26,.97);border:1px solid rgba(255,255,255,.09);border-radius:12px;box-shadow:0 20px 55px rgba(0,0,0,.85);display:flex;flex-direction:column;overflow:hidden;min-width:280px;min-height:180px;animation:fosIn .16s ease-out}
+@keyframes fosIn{from{opacity:0;transform:scale(.95) translateY(6px)}to{opacity:1;transform:none}}
+.fos-win.fos-focused{border-color:rgba(74,158,255,.25);box-shadow:0 24px 70px rgba(0,0,0,.9),0 0 0 1px rgba(74,158,255,.1)}
+.fos-win.fos-mini{display:none}
+.fos-titlebar{height:34px;background:rgba(12,16,30,.99);display:flex;align-items:center;padding:0 11px;gap:8px;cursor:move;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.046);user-select:none}
+.fos-traf{display:flex;gap:5px}.fos-tb{width:11px;height:11px;border-radius:50%;border:none;cursor:pointer;flex-shrink:0;outline:none;transition:filter .1s}.fos-tb:hover{filter:brightness(1.5)}
+.fos-tbc{background:#ff5f56}.fos-tbm{background:#ffbd2e}.fos-tbx{background:#27c93f}
+.fos-wico{font-size:13px;flex-shrink:0}.fos-wtitle{font-size:11.5px;color:rgba(255,255,255,.68);font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fos-body{flex:1;overflow:hidden;display:flex;flex-direction:column;position:relative}
+/* Resize handles */
+.fos-rz{position:absolute;z-index:5}
+.fos-rz-n{top:-3px;left:8px;right:8px;height:6px;cursor:n-resize}
+.fos-rz-s{bottom:-3px;left:8px;right:8px;height:6px;cursor:s-resize}
+.fos-rz-e{top:8px;right:-3px;bottom:8px;width:6px;cursor:e-resize}
+.fos-rz-w{top:8px;left:-3px;bottom:8px;width:6px;cursor:w-resize}
+.fos-rz-ne{top:-3px;right:-3px;width:12px;height:12px;cursor:ne-resize}
+.fos-rz-nw{top:-3px;left:-3px;width:12px;height:12px;cursor:nw-resize}
+.fos-rz-sw{bottom:-3px;left:-3px;width:12px;height:12px;cursor:sw-resize}
+.fos-rz-se{bottom:-3px;right:-3px;width:12px;height:12px;cursor:se-resize;opacity:.35;display:flex;align-items:flex-end;justify-content:flex-end;padding:2px;color:rgba(255,255,255,.5);font-size:11px}
+/* Terminal */
+.fos-term{background:#06070e;height:100%;display:flex;flex-direction:column}
+.fos-term-out{flex:1;overflow-y:auto;padding:10px 13px;line-height:1.65;white-space:pre-wrap;word-break:break-all;font-family:'Cascadia Code','Fira Code','DM Mono',monospace;font-size:12.5px;color:#c8ddf0}
+.fos-term-out::-webkit-scrollbar{width:3px}.fos-term-out::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:2px}
+.fos-term-row{display:flex;align-items:center;padding:5px 11px;border-top:1px solid rgba(255,255,255,.04);flex-shrink:0;gap:6px}
+.fos-prompt{color:#4a9eff;font-weight:700;font-size:12.5px;white-space:nowrap;font-family:inherit}
+.fos-inp{flex:1;background:none;border:none;outline:none;color:#c8ddf0;font-family:inherit;font-size:12.5px;caret-color:#4a9eff}
+.fos-cmd-echo{color:#7ec8e3}.fos-ok-txt{color:#7ee8a2}.fos-err-txt{color:#ff8484}.fos-ai-txt{color:#c084fc;font-style:italic}.fos-dim{color:rgba(180,200,240,.38)}
+/* Files */
+.fos-files{display:flex;height:100%}
+.fos-fsb{width:138px;background:rgba(5,7,14,.65);border-right:1px solid rgba(255,255,255,.046);padding:7px 5px;overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column;gap:1px}
+.fos-fmain{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.fos-fbar{padding:6px 9px;border-bottom:1px solid rgba(255,255,255,.046);display:flex;align-items:center;gap:6px;flex-shrink:0}
+.fos-flist{flex:1;overflow-y:auto;padding:5px}
+.fos-fitem{display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:7px;cursor:pointer;transition:background .1s}
+.fos-fitem:hover{background:rgba(255,255,255,.05)}.fos-fitem.fos-sel{background:rgba(74,158,255,.14)}
+.fos-fname{font-size:11.5px;color:#b8cce8;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fos-fmeta{font-size:9px;color:rgba(255,255,255,.22);white-space:nowrap}
+.fos-sbtn{display:flex;align-items:center;gap:6px;padding:5px 7px;border-radius:7px;font-size:11px;color:rgba(255,255,255,.48);cursor:pointer;border:none;background:none;width:100%;text-align:left;transition:all .1s}
+.fos-sbtn:hover{background:rgba(255,255,255,.07);color:#fff}
+/* Editor */
+.fos-editor{display:flex;flex-direction:column;height:100%}
+.fos-ebar{display:flex;align-items:center;padding:5px 8px;gap:6px;border-bottom:1px solid rgba(255,255,255,.046);flex-shrink:0;background:rgba(7,9,17,.85);flex-wrap:wrap}
+.fos-eta{flex:1;background:#05060c;color:#c8ddf0;font-family:'Cascadia Code','Fira Code','DM Mono',monospace;font-size:12.5px;border:none;outline:none;resize:none;padding:11px 13px;line-height:1.65;tab-size:2}
+.fos-sbar{height:21px;background:rgba(5,6,12,.9);border-top:1px solid rgba(255,255,255,.04);display:flex;align-items:center;padding:0 11px;flex-shrink:0}
+/* Agent */
+.fos-agent{display:flex;flex-direction:column;height:100%;background:#060810}
+.fos-alog{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:7px}
+.fos-alog::-webkit-scrollbar{width:3px}.fos-alog::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
+.fos-astep{background:rgba(255,255,255,.028);border:1px solid rgba(255,255,255,.065);border-radius:8px;padding:8px 10px;font-size:11.5px;animation:fosIn .15s}
+.fos-astep.fos-ok{border-color:rgba(78,230,120,.18)}.fos-astep.fos-err{border-color:rgba(255,100,100,.2)}
+.fos-acmd{font-family:'Cascadia Code',monospace;font-size:10.5px;color:#7ec8e3;margin-bottom:3px;word-break:break-all}
+.fos-aout{color:rgba(188,210,248,.52);white-space:pre-wrap;max-height:110px;overflow-y:auto;font-size:10.5px;font-family:'Cascadia Code',monospace;line-height:1.5}
+.fos-afooter{padding:9px 10px;border-top:1px solid rgba(255,255,255,.046);flex-shrink:0;display:flex;flex-direction:column;gap:6px}
+/* Monitor */
+.fos-mon{padding:12px;display:flex;flex-direction:column;gap:8px;overflow-y:auto;height:100%;background:#050710}
+.fos-mcard{background:rgba(255,255,255,.028);border:1px solid rgba(255,255,255,.065);border-radius:8px;padding:9px 11px}
+.fos-mlbl{font-size:9px;color:rgba(255,255,255,.32);font-weight:700;letter-spacing:.7px;text-transform:uppercase;margin-bottom:4px}
+.fos-mval{font-size:11px;color:#b8ccff;font-family:'Cascadia Code',monospace;white-space:pre;overflow:hidden}
+/* Browser */
+.fos-browser{display:flex;flex-direction:column;height:100%}
+.fos-bbar{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.046);flex-shrink:0;background:rgba(7,9,17,.85)}
+.fos-bfavs{display:flex;gap:5px;padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.036);flex-shrink:0;flex-wrap:wrap}
+.fos-frame{flex:1;border:none;background:#fff}
+/* Context menu */
+.fos-ctx{position:fixed;background:rgba(12,16,28,.97);backdrop-filter:blur(18px);border:1px solid rgba(255,255,255,.09);border-radius:9px;padding:4px;z-index:99999;min-width:148px;box-shadow:0 10px 36px rgba(0,0,0,.8)}
+.fos-ctx-item{padding:6px 12px;font-size:11.5px;color:rgba(255,255,255,.75);border-radius:6px;cursor:pointer;transition:background .1s}
+.fos-ctx-item:hover{background:rgba(74,158,255,.18);color:#fff}
+.fos-ctx-sep{height:1px;background:rgba(255,255,255,.07);margin:3px 0}
+/* ═══ AI Computer modal ═════════════════════════════════════════════════════ */
+.comp-src-card{background:rgba(255,255,255,.036);border:1px solid var(--glass-bdr);border-radius:9px;padding:9px 11px;margin-bottom:7px;transition:all .14s;cursor:pointer}
+.comp-src-card:hover{border-color:rgba(26,110,245,.32);background:rgba(26,110,245,.05)}
+.comp-cite{display:inline-block;background:rgba(26,110,245,.2);border:1px solid rgba(26,110,245,.35);border-radius:4px;padding:1px 5px;font-size:9.5px;font-weight:700;color:var(--blue);cursor:pointer;margin:0 2px;vertical-align:super}
+</style>
+
+<!-- ═════════ FusionOS overlay ═══════════════════════════════════════════ -->
+<div id="fos-overlay">
+  <div id="fos-bar">
+    <div class="fosb-logo" onclick="closeFusionOS()">⬛ FusionOS</div>
+    <div class="fosb-item" onclick="fosOpen('terminal')">Terminal</div>
+    <div class="fosb-item" onclick="fosOpen('files')">Files</div>
+    <div class="fosb-item" onclick="fosOpen('editor')">Editor</div>
+    <div class="fosb-item" onclick="fosOpen('agent')">Agent</div>
+    <div class="fosb-item" onclick="fosOpen('browser')">Browser</div>
+    <div class="fosb-item" onclick="fosOpen('monitor')">Monitor</div>
+    <div class="fosb-right">
+      <span style="font-size:9px;background:rgba(45,164,78,.18);border:1px solid rgba(45,164,78,.35);border-radius:10px;padding:2px 8px;color:#6ee77a">LIVE SANDBOX</span>
+      <span class="fosb-clock" id="fos-clock">00:00</span>
+      <button class="fosb-item" onclick="closeFusionOS()" style="border:none;background:none;color:rgba(255,255,255,.5);cursor:pointer">✕ Exit</button>
+    </div>
+  </div>
+  <div id="fos-desktop"></div>
+  <div id="fos-dock">
+    <button class="fos-dck" data-app="terminal" onclick="fosOpen('terminal')"><span class="fos-dck-ico">🖳</span><span class="fos-dck-lbl">Terminal</span><span class="fos-dck-dot"></span></button>
+    <button class="fos-dck" data-app="files" onclick="fosOpen('files')"><span class="fos-dck-ico">🗂</span><span class="fos-dck-lbl">Files</span><span class="fos-dck-dot"></span></button>
+    <button class="fos-dck" data-app="editor" onclick="fosOpen('editor')"><span class="fos-dck-ico">📝</span><span class="fos-dck-lbl">Editor</span><span class="fos-dck-dot"></span></button>
+    <button class="fos-dck" data-app="agent" onclick="fosOpen('agent')"><span class="fos-dck-ico">🤖</span><span class="fos-dck-lbl">Agent</span><span class="fos-dck-dot"></span></button>
+    <button class="fos-dck" data-app="browser" onclick="fosOpen('browser')"><span class="fos-dck-ico">🌐</span><span class="fos-dck-lbl">Browser</span><span class="fos-dck-dot"></span></button>
+    <button class="fos-dck" data-app="monitor" onclick="fosOpen('monitor')"><span class="fos-dck-ico">📊</span><span class="fos-dck-lbl">Monitor</span><span class="fos-dck-dot"></span></button>
+  </div>
+</div>
+
+<!-- ═════════ AI Computer modal ══════════════════════════════════════════ -->
+<div class="modal-overlay hidden" id="computerOverlay" onclick="if(event.target===this)closeComputer()">
+  <div style="background:var(--bg2);border:1px solid var(--glass-bdr2);border-radius:18px;width:min(96vw,780px);max-height:88vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.7)">
+    <div style="display:flex;align-items:center;gap:10px;padding:16px 18px 12px;border-bottom:1px solid var(--glass-bdr);flex-shrink:0">
+      <span style="font-size:20px">🖥</span>
+      <div style="flex:1"><div style="font-size:15px;font-weight:700;color:var(--tx)">AI Computer</div><div style="font-size:10.5px;color:var(--tx3)">Searches the web · reads pages · gives cited answers</div></div>
+      <button onclick="closeComputer()" style="background:none;border:none;color:var(--tx3);font-size:17px;cursor:pointer;padding:3px 7px;border-radius:7px">✕</button>
+    </div>
+    <div style="padding:14px 16px;flex-shrink:0;border-bottom:1px solid var(--glass-bdr)">
+      <div style="display:flex;gap:7px">
+        <input id="compQuery" placeholder="Ask anything — news, research, comparisons…" onkeydown="if(event.key==='Enter')runComputer()"
+          style="flex:1;background:rgba(255,255,255,.055);border:1px solid var(--glass-bdr2);border-radius:9px;padding:9px 13px;color:var(--tx);font-size:12.5px;outline:none"/>
+        <select id="compDepth" style="background:rgba(255,255,255,.055);border:1px solid var(--glass-bdr2);border-radius:9px;padding:8px 9px;color:var(--tx);font-size:11.5px;cursor:pointer">
+          <option value="fast">⚡ Fast</option><option value="normal" selected>🔍 Normal</option><option value="deep">🔬 Deep</option>
+        </select>
+        <button onclick="runComputer()" style="background:var(--grad);border:none;border-radius:9px;padding:9px 16px;color:#fff;font-size:12.5px;font-weight:700;cursor:pointer">Go ↵</button>
+      </div>
+      <div style="display:flex;gap:5px;margin-top:9px;flex-wrap:wrap">
+        <button class="comp-chip" onclick="setComp('Latest AI news today')">AI news</button>
+        <button class="comp-chip" onclick="setComp('How does quantum computing work')">Quantum computing</button>
+        <button class="comp-chip" onclick="setComp('Top free AI tools 2025')">Free AI tools</button>
+      </div>
+    </div>
+    <div id="compBody" style="flex:1;overflow-y:auto">
+      <div id="compPlaceholder" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:50px 24px;gap:12px;text-align:center">
+        <div style="font-size:40px;opacity:.28">🖥</div>
+        <div style="font-size:12px;color:var(--tx3);max-width:320px;line-height:1.6">Ask a question — searches the web, reads pages, returns a cited answer.</div>
+      </div>
+      <div id="compResult" style="display:none;padding:18px"></div>
+    </div>
+    <div style="padding:10px 16px;border-top:1px solid var(--glass-bdr);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+      <div id="compStatus" style="font-size:10.5px;color:var(--tx3)"></div>
+      <button onclick="sendCompToChat()" id="compSendBtn" style="display:none;background:rgba(26,110,245,.16);border:1px solid rgba(26,110,245,.38);border-radius:7px;padding:6px 13px;color:var(--blue);font-size:11.5px;font-weight:600;cursor:pointer">📤 Send to Chat</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════ SVG Art (Free) modal ════════════════════════════════════════ -->
+<div class="modal-overlay hidden" id="svgOverlay" onclick="if(event.target===this)closeSvgGen()">
+  <div style="background:var(--bg2);border:1px solid var(--glass-bdr2);border-radius:18px;width:min(96vw,560px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.7)">
+    <div style="display:flex;align-items:center;gap:10px;padding:16px 18px 13px;border-bottom:1px solid var(--glass-bdr)">
+      <span style="font-size:20px">🖼</span>
+      <div style="flex:1"><div style="font-size:15px;font-weight:700;color:var(--tx)">AI Art — Free &amp; Fast</div><div style="font-size:10.5px;color:var(--tx3)">LLM generates SVG → convert to PNG. No image API needed.</div></div>
+      <button onclick="closeSvgGen()" style="background:none;border:none;color:var(--tx3);font-size:17px;cursor:pointer;padding:3px 7px;border-radius:7px">✕</button>
+    </div>
+    <div style="padding:16px 18px">
+      <textarea id="svgPrompt" rows="3" placeholder="e.g. a futuristic city at night with neon lights…"
+        style="width:100%;background:rgba(255,255,255,.055);border:1px solid var(--glass-bdr2);border-radius:9px;padding:10px 13px;color:var(--tx);font-size:12.5px;resize:vertical;outline:none;box-sizing:border-box"></textarea>
+      <div style="display:flex;gap:7px;margin-top:9px;flex-wrap:wrap">
+        <select id="svgStyle" style="flex:1;background:rgba(255,255,255,.055);border:1px solid var(--glass-bdr2);border-radius:8px;padding:7px 9px;color:var(--tx);font-size:11.5px;cursor:pointer">
+          <option>detailed illustration</option><option>neon cyberpunk art</option><option>watercolor painting</option>
+          <option>minimalist vector art</option><option>abstract geometric art</option><option>flat design icon</option>
+          <option>dark fantasy art</option><option>cartoon comic style</option>
+        </select>
+        <select id="svgSize" style="background:rgba(255,255,255,.055);border:1px solid var(--glass-bdr2);border-radius:8px;padding:7px 9px;color:var(--tx);font-size:11.5px;cursor:pointer">
+          <option value="800 600">Landscape 800×600</option><option value="600 800">Portrait 600×800</option><option value="800 800">Square 800×800</option>
+        </select>
+      </div>
+      <div id="svgPreviewBox" style="display:none;margin-top:12px;border:1px solid var(--glass-bdr);border-radius:10px;overflow:hidden;text-align:center"><canvas id="svgCanvas" style="max-width:100%;display:block;margin:0 auto"></canvas></div>
+    </div>
+    <div style="padding:12px 18px;border-top:1px solid var(--glass-bdr);display:flex;gap:7px">
+      <button onclick="runSvgGen()" id="svgGenBtn" style="flex:1;background:var(--grad);border:none;border-radius:9px;padding:10px;color:#fff;font-size:12.5px;font-weight:700;cursor:pointer">✨ Generate Art</button>
+      <button onclick="svgDownload()" id="svgDlBtn" style="display:none;background:rgba(26,110,245,.16);border:1px solid rgba(26,110,245,.38);border-radius:9px;padding:10px 14px;color:var(--blue);font-size:12px;font-weight:600;cursor:pointer">⬇ PNG</button>
+      <button onclick="svgToChat()" id="svgChatBtn" style="display:none;background:rgba(78,200,100,.14);border:1px solid rgba(78,200,100,.32);border-radius:9px;padding:10px 14px;color:#7ee8a2;font-size:12px;font-weight:600;cursor:pointer">📤 Chat</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// FusionOS — complete window manager + 6 apps
+// ═══════════════════════════════════════════════════════════════════════════
+var _fos={wins:{},zTop:100,nid:1,cwd:'',clkTimer:null};
+var _FOS_APP={
+  terminal:{ico:'🖳',title:'Terminal',w:620,h:420},
+  files:   {ico:'🗂',title:'Files',   w:660,h:460},
+  editor:  {ico:'📝',title:'Editor',  w:700,h:480},
+  agent:   {ico:'🤖',title:'AI Agent',w:420,h:540},
+  browser: {ico:'🌐',title:'Browser', w:860,h:580},
+  monitor: {ico:'📊',title:'Monitor', w:450,h:440},
+};
+
+function openFusionOS(){
+  document.getElementById('fos-overlay').classList.add('fos-on');
+  if(!_fos.clkTimer){ _fosTick(); _fos.clkTimer=setInterval(_fosTick,1000); }
+  if(!Object.keys(_fos.wins).length){ fosOpen('terminal'); setTimeout(function(){fosOpen('agent',{x:30,y:50});},80); }
+}
+function closeFusionOS(){ document.getElementById('fos-overlay').classList.remove('fos-on'); }
+function _fosTick(){ var el=document.getElementById('fos-clock'); if(el){ var d=new Date(); el.textContent=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); } }
+
+function fosOpen(app,opts){
+  opts=opts||{};
+  if(!opts.forceNew){
+    for(var id in _fos.wins){ if(_fos.wins[id].app===app&&!opts.path){ fosFocus(id); if(_fos.wins[id].mini){ _fos.wins[id].el.classList.remove('fos-mini'); _fos.wins[id].mini=false; } return id; } }
+  }
+  var cfg=_FOS_APP[app]||{ico:'⬛',title:app,w:560,h:400};
+  var desk=document.getElementById('fos-desktop'); var dr=desk.getBoundingClientRect();
+  var nc=Object.keys(_fos.wins).length;
+  var x=opts.x!=null?opts.x:Math.max(18,Math.min(dr.width-cfg.w-18,60+nc*26));
+  var y=opts.y!=null?opts.y:Math.max(12,Math.min(dr.height-cfg.h-18,28+nc*22));
+  var id='fw'+(_fos.nid++);
+  var win=document.createElement('div'); win.className='fos-win'; win.id=id;
+  win.style.cssText='left:'+x+'px;top:'+y+'px;width:'+cfg.w+'px;height:'+cfg.h+'px;z-index:'+(++_fos.zTop);
+  win.innerHTML='<div class="fos-titlebar">'
+    +'<div class="fos-traf"><button class="fos-tb fos-tbc" onclick="fosClose(\''+id+'\')"></button><button class="fos-tb fos-tbm" onclick="fosMini(\''+id+'\')"></button><button class="fos-tb fos-tbx" onclick="fosMax(\''+id+'\')"></button></div>'
+    +'<span class="fos-wico">'+cfg.ico+'</span><span class="fos-wtitle">'+(opts.title||cfg.title)+'</span></div>'
+    +'<div class="fos-body" id="'+id+'-b"></div>'
+    +'<div class="fos-rz fos-rz-n" data-d="n"></div><div class="fos-rz fos-rz-s" data-d="s"></div>'
+    +'<div class="fos-rz fos-rz-e" data-d="e"></div><div class="fos-rz fos-rz-w" data-d="w"></div>'
+    +'<div class="fos-rz fos-rz-ne" data-d="ne"></div><div class="fos-rz fos-rz-nw" data-d="nw"></div>'
+    +'<div class="fos-rz fos-rz-sw" data-d="sw"></div><div class="fos-rz fos-rz-se" data-d="se">⌟</div>';
+  desk.appendChild(win);
+  _fos.wins[id]={el:win,app:app,mini:false,max:false,prev:null};
+  _fosDrag(win,id); _fosResize(win,id);
+  win.addEventListener('mousedown',function(){ fosFocus(id); });
+  fosFocus(id); _fosUpdateDock();
+  var b=document.getElementById(id+'-b');
+  if(app==='terminal') _fosTerminal(b,id);
+  else if(app==='files') _fosFiles(b,id,opts.path||'');
+  else if(app==='editor') _fosEditor(b,id,opts.path||'',opts.content);
+  else if(app==='agent') _fosAgent(b,id);
+  else if(app==='browser') _fosBrowser(b,id,opts.url||'');
+  else if(app==='monitor') _fosMon(b,id);
+  return id;
+}
+function fosFocus(id){ document.querySelectorAll('.fos-win').forEach(function(w){w.classList.remove('fos-focused');}); var w=_fos.wins[id]; if(w){w.el.classList.add('fos-focused');w.el.style.zIndex=++_fos.zTop;} }
+function fosClose(id){ var w=_fos.wins[id]; if(!w)return; w.el.remove(); delete _fos.wins[id]; _fosUpdateDock(); if(id==='_monid') clearInterval(_fos._monTimer); }
+function fosMini(id){ var w=_fos.wins[id]; if(!w)return; w.mini=!w.mini; w.el.classList.toggle('fos-mini',w.mini); _fosUpdateDock(); }
+function fosMax(id){
+  var w=_fos.wins[id]; if(!w)return;
+  var desk=document.getElementById('fos-desktop');
+  if(!w.max){ w.prev={l:w.el.style.left,t:w.el.style.top,ww:w.el.style.width,hh:w.el.style.height}; w.el.style.cssText='left:0;top:0;width:'+desk.clientWidth+'px;height:'+desk.clientHeight+'px;z-index:'+(++_fos.zTop); w.max=true; }
+  else{ var p=w.prev; w.el.style.left=p.l; w.el.style.top=p.t; w.el.style.width=p.ww; w.el.style.height=p.hh; w.max=false; }
+  fosFocus(id);
+}
+function _fosUpdateDock(){ var r={}; for(var id in _fos.wins)r[_fos.wins[id].app]=true; document.querySelectorAll('.fos-dck').forEach(function(b){b.classList.toggle('fos-running',!!r[b.dataset.app]);}); }
+function _fosDrag(win,id){
+  var bar=win.querySelector('.fos-titlebar'); var sx,sy,ox,oy,on=false;
+  bar.addEventListener('mousedown',function(e){ if(e.target.classList.contains('fos-tb'))return; on=true; sx=e.clientX; sy=e.clientY; ox=win.offsetLeft; oy=win.offsetTop; document.body.style.userSelect='none'; fosFocus(id); });
+  document.addEventListener('mousemove',function(e){ if(!on)return; var desk=document.getElementById('fos-desktop'); var nx=Math.max(0,Math.min(desk.clientWidth-50,ox+e.clientX-sx)); var ny=Math.max(0,Math.min(desk.clientHeight-30,oy+e.clientY-sy)); win.style.left=nx+'px'; win.style.top=ny+'px'; });
+  document.addEventListener('mouseup',function(){ on=false; document.body.style.userSelect=''; });
+}
+function _fosResize(win,id){
+  win.querySelectorAll('.fos-rz').forEach(function(h){
+    var dir=h.dataset.d||'se',sx,sy,ox,oy,ow,oh,on=false;
+    h.addEventListener('mousedown',function(e){ on=true; sx=e.clientX; sy=e.clientY; ox=win.offsetLeft; oy=win.offsetTop; ow=win.offsetWidth; oh=win.offsetHeight; e.stopPropagation(); e.preventDefault(); document.body.style.userSelect='none'; fosFocus(id); });
+    document.addEventListener('mousemove',function(e){ if(!on)return; var dx=e.clientX-sx,dy=e.clientY-sy,nx=ox,ny=oy,nw=ow,nh=oh; if(dir.indexOf('e')>=0)nw=Math.max(280,ow+dx); if(dir.indexOf('s')>=0)nh=Math.max(180,oh+dy); if(dir.indexOf('w')>=0){nw=Math.max(280,ow-dx);nx=ox+(ow-nw);} if(dir.indexOf('n')>=0){nh=Math.max(180,oh-dy);ny=oy+(oh-nh);} win.style.left=nx+'px';win.style.top=ny+'px';win.style.width=nw+'px';win.style.height=nh+'px'; });
+    document.addEventListener('mouseup',function(){ on=false; document.body.style.userSelect=''; });
+  });
+}
+
+async function _fosPost(ep,body){ var r=await apiFetch(ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); return await r.json(); }
+function _fosIcon(name){ var e=(name.split('.').pop()||'').toLowerCase(); return {py:'🐍',js:'📜',ts:'📘',html:'🌐',css:'🎨',json:'📋',md:'📄',txt:'📝',sh:'🦀',csv:'📊',yml:'⚙️',yaml:'⚙️',png:'🖼',jpg:'🖼',svg:'🖼',pdf:'📕',zip:'🗜',go:'🐹',rs:'🦀',cpp:'🔧',c:'🔧',cs:'🔷',rb:'💎'}[e]||'📄'; }
+function _fosFmt(b){ if(b<1024)return b+'B'; if(b<1048576)return (b/1024).toFixed(1)+'K'; return (b/1048576).toFixed(1)+'M'; }
+
+// ── Terminal ─────────────────────────────────────────────────────────────────
+function _fosTerminal(body,id){
+  body.innerHTML='<div class="fos-term"><div class="fos-term-out" id="'+id+'-o"><span class="fos-dim">FusionOS Terminal — real Linux shell. Type help for tips.\n\n</span></div><div class="fos-term-row"><span class="fos-prompt" id="'+id+'-pr">~ $</span><input class="fos-inp" id="'+id+'-i" autocomplete="off" spellcheck="false" placeholder="type a command…"/></div></div>';
+  var inp=document.getElementById(id+'-i'); var hist=[],hi=0;
+  inp.addEventListener('keydown',async function(e){
+    if(e.key==='Enter'){ var cmd=inp.value; inp.value=''; if(!cmd.trim())return; hist.push(cmd); hi=hist.length; await _fosRunCmd(id,cmd); }
+    else if(e.key==='ArrowUp'){ if(hi>0){hi--;inp.value=hist[hi];setTimeout(function(){inp.setSelectionRange(99,99);},0);} e.preventDefault(); }
+    else if(e.key==='ArrowDown'){ if(hi<hist.length-1){hi++;inp.value=hist[hi];}else{hi=hist.length;inp.value='';} e.preventDefault(); }
+  });
+  setTimeout(function(){inp.focus();},100);
+}
+async function _fosRunCmd(id,cmd){
+  var out=document.getElementById(id+'-o'); if(!out)return;
+  var pr=document.getElementById(id+'-pr');
+  var cwd=(pr.textContent.split(' $')[0]||'~').replace(/^~\//,'').replace(/^~$/,'');
+  if(cmd.trim()==='help'){ out.innerHTML+='<span class="fos-cmd-echo">$ help</span>\n<span class="fos-dim">Commands: any bash, python3, node, curl, git, gcc, npm, pip\nSpecials: clear, cd, help\nFor multi-step tasks use the Agent app.</span>\n\n'; out.scrollTop=out.scrollHeight; return; }
+  out.innerHTML+='<span class="fos-cmd-echo">$ '+escHtml(cmd)+'</span>\n';
+  out.scrollTop=out.scrollHeight;
+  try{
+    var d=await _fosPost('/api/fos/exec',{cmd:cmd,cwd:cwd});
+    if(d.stdout==='__CLEAR__'){ out.innerHTML=''; return; }
+    if(d.stdout) out.innerHTML+='<span class="fos-ok-txt">'+escHtml(d.stdout)+(d.stdout.endsWith('\n')?'':'\n')+'</span>';
+    if(d.stderr) out.innerHTML+='<span class="fos-err-txt">'+escHtml(d.stderr)+(d.stderr.endsWith('\n')?'':'\n')+'</span>';
+    if(!d.stdout&&!d.stderr) out.innerHTML+='\n';
+    pr.textContent='~'+(d.cwd?'/'+d.cwd:'')+' $';
+  }catch(e){ out.innerHTML+='<span class="fos-err-txt">Error: '+escHtml(e.message)+'</span>\n'; }
+  out.innerHTML+='\n'; out.scrollTop=out.scrollHeight;
+}
+
+// ── Files ─────────────────────────────────────────────────────────────────────
+async function _fosFiles(body,id,startPath){
+  body.innerHTML='<div class="fos-files"><div class="fos-fsb"><button class="fos-sbtn" onclick="_fosFNav(\''+id+'\',\'\')">🏠 Home</button><button class="fos-sbtn" onclick="_fosFNew(\''+id+'\',\'file\')">📄 New File</button><button class="fos-sbtn" onclick="_fosFNew(\''+id+'\',\'folder\')">📁 New Folder</button><button class="fos-sbtn" onclick="_fosFNav(\''+id+'\',_fos.wins[\''+id+'\']&&_fos.wins[\''+id+'\'].curPath||\'\')">🔄 Refresh</button></div><div class="fos-fmain"><div class="fos-fbar"><span style="font-size:11px;color:rgba(255,255,255,.35)">📍</span><span id="'+id+'-fp" style="font-size:11px;color:rgba(255,255,255,.5);font-family:monospace">~</span></div><div class="fos-flist" id="'+id+'-fl"></div></div></div>';
+  _fos.wins[id].curPath=startPath||'';
+  await _fosFNav(id,startPath||'');
+}
+async function _fosFNav(id,path){
+  var w=_fos.wins[id]; if(!w)return; w.curPath=path;
+  var d=await _fosPost('/api/fos/files',{action:'list',path:path});
+  var el=document.getElementById(id+'-fl'); var pe=document.getElementById(id+'-fp');
+  if(!el)return;
+  if(d.error){el.innerHTML='<div style="padding:16px;color:#ff8484;font-size:11.5px">'+escHtml(d.error)+'</div>';return;}
+  pe.textContent='~/'+(d.path||'');
+  var h='';
+  if(path){ var par=path.split('/').slice(0,-1).join('/'); h+='<div class="fos-fitem" onclick="_fosFNav(\''+id+'\',\''+escHtml(par)+'\')"><span>⬅</span><span class="fos-fname">.. (up)</span></div>'; }
+  if(!d.items.length) h+='<div style="padding:14px;color:rgba(255,255,255,.22);font-size:11px;text-align:center">Empty</div>';
+  d.items.forEach(function(it){
+    var full=(path?path+'/':'')+it.name; var q=full.replace(/'/g,"\\'");
+    h+='<div class="fos-fitem" oncontextmenu="_fosFCtx(event,\''+id+'\',\''+q+'\','+it.is_dir+');return false;" ondblclick="'+(it.is_dir?'_fosFNav(\''+id+'\',\''+q+'\')':'fosOpen(\'editor\',{forceNew:false,path:\''+q+'\'})') +'">'+'<span>'+( it.is_dir?'📁':_fosIcon(it.name))+'</span><span class="fos-fname">'+escHtml(it.name)+'</span><span class="fos-fmeta">'+(!it.is_dir?_fosFmt(it.size):' ')+'</span></div>';
+  });
+  el.innerHTML=h;
+}
+async function _fosFNew(id,type){
+  var n=prompt(type==='file'?'File name:':'Folder name:',type==='file'?'untitled.py':'new_folder'); if(!n)return;
+  var w=_fos.wins[id]; var path=(w.curPath?w.curPath+'/':'')+n;
+  await _fosPost('/api/fos/files',{action:type==='file'?'new_file':'mkdir',path:path});
+  _fosFNav(id,w.curPath||'');
+}
+function _fosFCtx(e,id,path,isDir){
+  document.querySelectorAll('.fos-ctx').forEach(function(c){c.remove();});
+  var m=document.createElement('div'); m.className='fos-ctx';
+  m.style.cssText='left:'+e.clientX+'px;top:'+e.clientY+'px';
+  var items=[];
+  if(!isDir) items.push(['✏️ Open in Editor','fosOpen(\'editor\',{forceNew:false,path:\''+path.replace(/'/g,"\\'")+'\'});']);
+  items.push(['✏️ Rename','_fosFRename(\''+id+'\',\''+path.replace(/'/g,"\\'")+'\');']);
+  items.push(['🗑 Delete','_fosFDel(\''+id+'\',\''+path.replace(/'/g,"\\'")+'\');']);
+  items.forEach(function(it){ var d=document.createElement('div'); d.className='fos-ctx-item'; d.textContent=it[0]; d.onclick=function(){m.remove();eval(it[1]);}; m.appendChild(d); });
+  document.body.appendChild(m);
+  setTimeout(function(){document.addEventListener('click',function h(){m.remove();document.removeEventListener('click',h);},{once:true});},10);
+}
+async function _fosFRename(id,path){ var n=prompt('Rename to:',path.split('/').pop()); if(!n)return; var par=path.split('/').slice(0,-1).join('/'); await _fosPost('/api/fos/files',{action:'rename',path:path,new_path:(par?par+'/':'')+n}); _fosFNav(id,_fos.wins[id].curPath||''); }
+async function _fosFDel(id,path){ if(!confirm('Delete "'+path+'"?'))return; await _fosPost('/api/fos/files',{action:'delete',path:path}); _fosFNav(id,_fos.wins[id].curPath||''); }
+
+// ── Editor ────────────────────────────────────────────────────────────────────
+async function _fosEditor(body,id,path,initContent){
+  body.innerHTML='<div class="fos-editor"><div class="fos-ebar"><input id="'+id+'-fn" placeholder="filename.py" style="background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.09);border-radius:6px;padding:4px 8px;color:#c8ddf0;font-size:11px;font-family:monospace;width:180px" value="'+escHtml(path||'')+'"/><button onclick="_fosEdSave(\''+id+'\')" style="background:rgba(74,158,255,.16);border:1px solid rgba(74,158,255,.32);border-radius:6px;padding:4px 11px;color:#7ec3ff;font-size:11px;font-weight:600;cursor:pointer">💾 Save</button><button onclick="_fosEdRun(\''+id+'\')" style="background:rgba(78,230,120,.13);border:1px solid rgba(78,230,120,.3);border-radius:6px;padding:4px 11px;color:#7ee8a2;font-size:11px;font-weight:600;cursor:pointer">▶ Run</button><span id="'+id+'-est" style="font-size:10px;color:rgba(255,255,255,.28);margin-left:auto"></span></div><textarea class="fos-eta" id="'+id+'-ta" spellcheck="false" placeholder="Start typing or open a file from Files…"></textarea><div class="fos-sbar"><span style="font-size:9.5px;color:rgba(255,255,255,.28)" id="'+id+'-sl">Ready</span></div></div>';
+  var ta=document.getElementById(id+'-ta');
+  ta.addEventListener('keydown',function(e){ if(e.key==='Tab'){e.preventDefault();var s=ta.selectionStart;ta.value=ta.value.substring(0,s)+'  '+ta.value.substring(ta.selectionEnd);ta.selectionStart=ta.selectionEnd=s+2;} if(e.key==='s'&&(e.ctrlKey||e.metaKey)){e.preventDefault();_fosEdSave(id);} });
+  if(path){ var rd=await _fosPost('/api/fos/files',{action:'read',path:path}); if(rd.content!=null) ta.value=rd.content; document.getElementById(id+'-sl').textContent=path; }
+  else if(initContent!=null) ta.value=initContent;
+}
+async function _fosEdSave(id){
+  var path=document.getElementById(id+'-fn').value.trim(); if(!path){showToast('Enter filename first');return;}
+  var st=document.getElementById(id+'-est'); st.textContent='Saving…';
+  await _fosPost('/api/fos/files',{action:'write',path:path,content:document.getElementById(id+'-ta').value});
+  st.textContent='✅ '+new Date().toLocaleTimeString(); document.getElementById(id+'-sl').textContent=path;
+}
+async function _fosEdRun(id){
+  var path=document.getElementById(id+'-fn').value.trim(); if(!path){showToast('Save with a filename first');return;}
+  await _fosEdSave(id);
+  var runners={py:'python3',js:'node',sh:'bash',rb:'ruby',pl:'perl',go:'go run',c:'gcc -o /tmp/_fos_out "$f" && /tmp/_fos_out',cpp:'g++ -o /tmp/_fos_out "$f" && /tmp/_fos_out'};
+  var ext=path.split('.').pop(); var runner=runners[ext]; if(!runner){showToast('Don\'t know how to run .'+ext);return;}
+  var termId=fosOpen('terminal');
+  setTimeout(async function(){ var cmd=runner.indexOf('"$f"')>=0?runner.replace(/"?\$f"?/g,'"'+path+'"'):(runner+' "'+path+'"'); await _fosRunCmd(termId,cmd); },280);
+}
+
+// ── Browser ───────────────────────────────────────────────────────────────────
+function _fosBrowser(body,id,startUrl){
+  var url=startUrl||'https://www.google.com';
+  body.innerHTML='<div class="fos-browser"><div class="fos-bbar"><button onclick="_fosBNav(\''+id+'\',\'back\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:26px;height:24px;color:#fff;cursor:pointer">←</button><button onclick="_fosBNav(\''+id+'\',\'fwd\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:26px;height:24px;color:#fff;cursor:pointer">→</button><button onclick="_fosBRld(\''+id+'\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:26px;height:24px;color:#fff;cursor:pointer">↻</button><input id="'+id+'-url" value="'+escHtml(url)+'" style="flex:1;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.09);border-radius:7px;padding:5px 10px;color:#c8ddf0;font-size:11.5px;outline:none" onkeydown="if(event.key===\'Enter\')_fosBGo(\''+id+'\')"/><button onclick="_fosBGo(\''+id+'\')" style="background:rgba(74,158,255,.16);border:1px solid rgba(74,158,255,.3);border-radius:7px;padding:5px 10px;color:#7ec3ff;font-size:11px;font-weight:600;cursor:pointer">Go</button></div><div class="fos-bfavs"><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://www.google.com\')">Google</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://github.com\')">GitHub</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://stackoverflow.com\')">StackOverflow</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://developer.mozilla.org\')">MDN</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://pypi.org\')">PyPI</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://npmjs.com\')">npm</button></div><iframe id="'+id+'-fr" class="fos-frame" src="'+escHtml(url)+'" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-navigation"></iframe></div>';
+}
+function _fosBGo(id){ var u=document.getElementById(id+'-url').value.trim(); if(u&&!u.startsWith('http'))u='https://'+u; _fosBLoad(id,u); }
+function _fosBLoad(id,url){ var fr=document.getElementById(id+'-fr'); var ur=document.getElementById(id+'-url'); if(fr)fr.src=url; if(ur)ur.value=url; }
+function _fosBNav(id,dir){ var fr=document.getElementById(id+'-fr'); if(fr){try{dir==='back'?fr.contentWindow.history.back():fr.contentWindow.history.forward();}catch(e){}} }
+function _fosBRld(id){ var fr=document.getElementById(id+'-fr'); if(fr)fr.src=fr.src; }
+
+// ── Agent ─────────────────────────────────────────────────────────────────────
+function _fosAgent(body,id){
+  body.innerHTML='<div class="fos-agent"><div class="fos-alog" id="'+id+'-al"><div style="padding:16px;text-align:center;color:rgba(255,255,255,.28);font-size:12px">🤖 Give me a task and I\'ll plan &amp; run real commands autonomously.</div></div><div class="fos-afooter"><div style="display:flex;gap:6px"><select id="'+id+'-sp" style="flex:1;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:7px;padding:5px 6px;color:#b8cce8;font-size:10.5px"><option value="fast">⚡ Fast (quick tasks)</option><option value="balanced" selected>⚖️ Balanced</option><option value="thorough">🧠 Thorough (complex)</option></select><select id="'+id+'-ms" style="background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:7px;padding:5px 6px;color:#b8cce8;font-size:10.5px"><option value="6">6 steps</option><option value="10" selected>10 steps</option><option value="14">14 steps</option><option value="20">20 steps</option></select></div><textarea id="'+id+'-g" rows="2" placeholder="e.g. generate 10 passwords, save to passwords.txt and show them" style="background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:8px 10px;color:#c8ddf0;font-size:12px;resize:none;outline:none"></textarea><button id="'+id+'-rb" onclick="_fosAgentRun(\''+id+'\')" style="background:linear-gradient(135deg,#4a9eff,#a855f7);border:none;border-radius:8px;padding:9px;color:#fff;font-size:12px;font-weight:700;cursor:pointer">✨ Run Agent</button></div></div>';
+}
+async function _fosAgentRun(id,resumeTr,resumeStep){
+  var goalEl=document.getElementById(id+'-g'); var goal=goalEl.value.trim(); if(!goal){showToast('Describe a task first');return;}
+  var log=document.getElementById(id+'-al'); var btn=document.getElementById(id+'-rb');
+  var speed=(document.getElementById(id+'-sp')||{value:'balanced'}).value;
+  var maxS=parseInt((document.getElementById(id+'-ms')||{value:'10'}).value,10);
+  if(!resumeTr){ log.innerHTML='<div class="fos-astep" style="border-color:rgba(168,85,247,.28)"><b style="color:#c084fc">🎯 Goal:</b> '+escHtml(goal)+'</div>'; }
+  btn.disabled=true; btn.textContent='⏳ Working…'; goalEl.disabled=true;
+  var tr=resumeTr||[]; var sn=resumeStep||1;
+  try{
+    while(sn<=maxS){
+      var sd=document.createElement('div'); sd.className='fos-astep'; sd.innerHTML='<span class="fos-dim">🧠 Step '+sn+'…</span>'; log.appendChild(sd); log.scrollTop=log.scrollHeight;
+      var d=await _fosPost('/api/fos/agent',{goal:goal,transcript:tr,step:sn,speed:speed,max_steps:maxS});
+      if(d.action==='run'){
+        sd.classList.add(d.code===0?'fos-ok':'fos-err');
+        sd.innerHTML=(d.explain?'<div style="color:rgba(255,255,255,.5);margin-bottom:3px;font-size:10.5px">💭 '+escHtml(d.explain)+'</div>':'')
+          +'<div class="fos-acmd">$ '+escHtml(d.cmd)+'</div>'
+          +(d.stdout?'<div class="fos-aout">'+escHtml(d.stdout)+'</div>':'')
+          +(d.stderr?'<div class="fos-aout" style="color:#ff8484">'+escHtml(d.stderr)+'</div>':'');
+        tr.push({cmd:d.cmd,stdout:d.stdout,stderr:d.stderr,code:d.code}); sn++;
+        log.scrollTop=log.scrollHeight; await new Promise(function(r){setTimeout(r,180);});
+      } else if(d.action==='done'){
+        sd.classList.add('fos-ok'); sd.innerHTML='<div style="color:#7ee8a2;font-weight:600;margin-bottom:3px">✅ Done</div><div style="color:rgba(255,255,255,.72)">'+escHtml(d.summary||'Completed.')+'</div>';
+        log.scrollTop=log.scrollHeight; break;
+      } else {
+        sd.classList.add('fos-err'); var snc=sn,trc=JSON.stringify(tr);
+        sd.dataset.tr=trc;
+        sd.innerHTML='<div style="color:#ff8484;font-weight:600;margin-bottom:3px">⚠️ Stopped</div><div style="color:rgba(255,255,255,.6);margin-bottom:6px">'+escHtml(d.reason||'Could not continue.')+'</div><button onclick="_fosAgentResume(\''+id+'\','+snc+',this)" style="background:rgba(74,158,255,.16);border:1px solid rgba(74,158,255,.32);border-radius:6px;padding:4px 10px;color:#7ec3ff;font-size:10.5px;cursor:pointer">↻ Retry step</button>';
+        log.scrollTop=log.scrollHeight; break;
+      }
+    }
+  }catch(e){ var ed=document.createElement('div'); ed.className='fos-astep fos-err'; ed.textContent='❌ '+e.message; log.appendChild(ed); }
+  btn.disabled=false; btn.textContent='✨ Run Agent'; goalEl.disabled=false;
+}
+function _fosAgentResume(id,step,btn){ var sd=btn.closest('.fos-astep'); var tr=[]; try{tr=JSON.parse(sd.dataset.tr||'[]');}catch(e){} _fosAgentRun(id,tr,step); }
+
+// ── Monitor ───────────────────────────────────────────────────────────────────
+function _fosMon(body,id){
+  body.innerHTML='<div class="fos-mon" id="'+id+'-mn"><div style="text-align:center;color:rgba(255,255,255,.28);padding:26px;font-size:11.5px">Loading…</div></div>';
+  _fosMonRef(id); _fos._monTimer=setInterval(function(){ if(!_fos.wins[id]){clearInterval(_fos._monTimer);return;} _fosMonRef(id); },5000);
+}
+async function _fosMonRef(id){
+  var el=document.getElementById(id+'-mn'); if(!el)return;
+  try{
+    var d=await _fosPost('/api/fos/stats',{});
+    el.innerHTML='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">'
+      +'<div class="fos-mcard"><div class="fos-mlbl">Sandbox Files</div><div class="fos-mval">'+d.files+' files / '+d.dirs+' dirs</div></div>'
+      +'<div class="fos-mcard"><div class="fos-mlbl">Sandbox Size</div><div class="fos-mval">'+d.size_kb+' KB</div></div>'
+      +'<div class="fos-mcard"><div class="fos-mlbl">Python</div><div class="fos-mval">v'+d.python+'</div></div>'
+      +'<div class="fos-mcard"><div class="fos-mlbl">Server Uptime</div><div class="fos-mval">'+Math.floor(d.uptime_s/60)+'m '+Math.floor(d.uptime_s%60)+'s</div></div>'
+      +'</div>'
+      +'<div class="fos-mcard"><div class="fos-mlbl">Disk</div><div class="fos-mval">'+d.disk_used_gb+'GB used / '+d.disk_total_gb+'GB total ('+d.disk_free_gb+'GB free)</div></div>'
+      +'<div class="fos-mcard"><div class="fos-mlbl">AI Models</div>'
+      +'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:4px">'
+      +'<span style="font-size:11px;color:'+(d.groq?'#7ee8a2':'#ff8484')+'">●  Groq '+(d.groq?'online':'offline')+'</span>'
+      +'<span style="font-size:11px;color:'+(d.openrouter?'#7ee8a2':'#ff8484')+'">●  OpenRouter '+(d.openrouter?'online':'offline')+'</span>'
+      +'</div></div>'
+      +'<div class="fos-mcard"><div class="fos-mlbl">Platform</div><div class="fos-mval" style="font-size:9.5px">'+escHtml(d.platform||'')+'</div></div>';
+  }catch(e){}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AI Computer
+// ═══════════════════════════════════════════════════════════════════════════
+var _compLastResult='',_compLastSources=[];
+function openComputer(){ document.getElementById('computerOverlay').classList.remove('hidden'); setTimeout(function(){document.getElementById('compQuery').focus();},150); }
+function closeComputer(){ document.getElementById('computerOverlay').classList.add('hidden'); }
+function setComp(q){ document.getElementById('compQuery').value=q; runComputer(); }
+
+async function runComputer(){
+  var query=document.getElementById('compQuery').value.trim(); if(!query){showToast('Ask a question first');return;}
+  var depth=document.getElementById('compDepth').value;
+  document.getElementById('compPlaceholder').style.display='none';
+  document.getElementById('compSendBtn').style.display='none';
+  var res=document.getElementById('compResult'); res.style.display='block';
+  res.innerHTML='<div style="display:flex;align-items:center;gap:10px;padding:20px"><div class="thinking-dots"><span></span><span></span><span></span></div><span style="color:var(--tx2);font-size:13px" id="compStep">🔍 Searching…</span></div>';
+  document.getElementById('compStatus').textContent='';
+  var prog; function setStep(t){var el=document.getElementById('compStep');if(el)el.textContent=t;}
+  try{
+    var r=await apiFetch('/api/computer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:query,depth:depth,num_sources:{'fast':3,'normal':6,'deep':10}[depth]||6})});
+    if(!r.ok){var e=await r.json();throw new Error(e.error||'Failed');}
+    setStep('📖 Reading sources…');
+    var d=await r.json();
+    _compLastResult=d.answer||''; _compLastSources=d.sources||[];
+    var srcHtml='<div style="margin-bottom:14px"><div style="font-size:9.5px;font-weight:700;letter-spacing:.8px;color:var(--tx3);text-transform:uppercase;margin-bottom:7px">📚 Sources ('+d.sources.length+')</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:5px">';
+    d.sources.forEach(function(s,i){ srcHtml+='<div class="comp-src-card" onclick="window.open(\''+escHtml(s.url)+'\',\'_blank\')"><div style="display:flex;align-items:center;gap:6px"><span class="comp-cite">'+(i+1)+'</span><div style="min-width:0"><div style="font-size:11px;font-weight:600;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+escHtml(s.title||s.url)+'</div><div style="font-size:9px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+escHtml(s.url)+'</div></div></div></div>'; });
+    srcHtml+='</div></div>';
+    var ansHtml='<div style="font-size:13.5px;line-height:1.75;color:var(--tx);margin-bottom:16px">'+fmt(d.answer||'No answer generated.')+'</div>';
+    var relHtml='';
+    if(d.related&&d.related.length){ relHtml='<div><div style="font-size:9.5px;font-weight:700;letter-spacing:.8px;color:var(--tx3);text-transform:uppercase;margin-bottom:7px">💡 Related</div><div style="display:flex;flex-direction:column;gap:5px">'; d.related.forEach(function(r2){ relHtml+='<button onclick="setComp('+JSON.stringify(r2)+')" style="background:rgba(255,255,255,.038);border:1px solid var(--glass-bdr);border-radius:7px;padding:6px 11px;font-size:11.5px;color:var(--tx2);cursor:pointer;text-align:left;transition:all .12s">→ '+escHtml(r2)+'</button>'; }); relHtml+='</div></div>'; }
+    res.innerHTML=srcHtml+ansHtml+relHtml;
+    document.getElementById('compStatus').textContent=d.sources.length+' sources · '+(d.elapsed_ms?Math.round(d.elapsed_ms/100)/10+'s':'');
+    document.getElementById('compSendBtn').style.display='inline-block';
+  }catch(e){ res.innerHTML='<div style="color:var(--red);padding:20px">❌ '+escHtml(e.message)+'</div>'; }
+}
+function sendCompToChat(){ var q=document.getElementById('compQuery').value.trim(); closeComputer(); addMsg('ai','**Computer Search: '+q+'**\n\n'+_compLastResult,null,null); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SVG Free Art Gen
+// ═══════════════════════════════════════════════════════════════════════════
+var _svgB64='';
+function openSvgGen(){ document.getElementById('svgOverlay').classList.remove('hidden'); document.getElementById('svgPreviewBox').style.display='none'; ['svgDlBtn','svgChatBtn'].forEach(function(x){document.getElementById(x).style.display='none';}); setTimeout(function(){document.getElementById('svgPrompt').focus();},150); }
+function closeSvgGen(){ document.getElementById('svgOverlay').classList.add('hidden'); }
+async function runSvgGen(){
+  var prompt=document.getElementById('svgPrompt').value.trim(); if(!prompt){showToast('Describe the art');return;}
+  var style=document.getElementById('svgStyle').value; var sz=document.getElementById('svgSize').value.split(' ');
+  var W=parseInt(sz[0])||800,H=parseInt(sz[1])||600;
+  var btn=document.getElementById('svgGenBtn'); btn.textContent='⏳ Generating…'; btn.disabled=true;
+  document.getElementById('svgPreviewBox').style.display='none';
+  try{
+    var r=await apiFetch('/api/gen_svg_img',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:prompt,style:style,width:W,height:H})});
+    var d=await r.json(); if(d.error)throw new Error(d.error);
+    var canvas=document.getElementById('svgCanvas'); canvas.width=W; canvas.height=H;
+    var ctx=canvas.getContext('2d'); var blob=new Blob([d.svg],{type:'image/svg+xml'});
+    var url=URL.createObjectURL(blob); var img=new Image();
+    img.onload=function(){ ctx.drawImage(img,0,0,W,H); URL.revokeObjectURL(url); _svgB64=canvas.toDataURL('image/png').split(',')[1]; document.getElementById('svgPreviewBox').style.display='block'; ['svgDlBtn','svgChatBtn'].forEach(function(x){document.getElementById(x).style.display='inline-block';}); showToast('🎨 Generated!'); };
+    img.onerror=function(){ document.getElementById('svgPreviewBox').innerHTML='<div style="padding:10px">'+d.svg+'</div>'; document.getElementById('svgPreviewBox').style.display='block'; };
+    img.src=url;
+  }catch(e){showToast('❌ '+e.message);}
+  btn.textContent='✨ Generate Art'; btn.disabled=false;
+}
+function svgDownload(){ if(!_svgB64){showToast('Generate first');return;} var a=document.createElement('a'); a.href='data:image/png;base64,'+_svgB64; a.download='fusion-art.png'; a.click(); }
+function svgToChat(){ if(!_svgB64){showToast('Generate first');return;} closeSvgGen(); var bbl=addMsg('ai','',null,null); bbl.innerHTML='<img src="data:image/png;base64,'+_svgB64+'" style="max-width:100%;border-radius:10px;border:1px solid var(--glass-bdr2)"/>'; }
+</script>
 </body></html>"""
 
 
@@ -9242,89 +8751,47 @@ async def api_gen_pptx(request: Request):
         data   = await request.json()
         md     = data.get("content", "")
         theme  = data.get("theme", "dark")
-        aspect = data.get("aspect", "169")   # "169" | "1610" | "43"
         fname  = data.get("filename", "slides.pptx")
 
-        # ── Slide dimensions ─────────────────────────────────────────────────
-        DIMS = {
-            "169":  (13.33, 7.5),
-            "1610": (10.0,  6.25),
-            "43":   (10.0,  7.5),
-        }
-        W, H = DIMS.get(aspect, (13.33, 7.5))
-
-        # ── Professional Themes ──────────────────────────────────────────────
-        # Each theme: bg1/bg2 (slide background gradient), a1/a2 (accent gradient),
-        # tx/tx2/tx3 (text levels), card (card bg), stripe (header stripe)
+        # ── Themes ────────────────────────────────────────────────────────
         THEMES = {
-            "dark":      dict(bg1=(0x04,0x06,0x14),bg2=(0x08,0x0e,0x28),
-                              a1=(0x1a,0x6e,0xf5),a2=(0x7c,0x3a,0xed),
-                              tx=(0xff,0xff,0xff),tx2=(0xb0,0xcc,0xee),tx3=(0x60,0x90,0xb8),
-                              card=(0x0c,0x14,0x30),stripe=(0x1a,0x6e,0xf5)),
-            "light":     dict(bg1=(0xf5,0xf7,0xff),bg2=(0xe8,0xed,0xff),
-                              a1=(0x1a,0x6e,0xf5),a2=(0x7c,0x3a,0xed),
-                              tx=(0x08,0x0c,0x28),tx2=(0x28,0x40,0x80),tx3=(0x60,0x80,0xb8),
-                              card=(0xff,0xff,0xff),stripe=(0x1a,0x6e,0xf5)),
-            "ocean":     dict(bg1=(0x02,0x0e,0x1c),bg2=(0x04,0x18,0x30),
-                              a1=(0x00,0xb4,0xd8),a2=(0x00,0x77,0xb6),
-                              tx=(0xe8,0xf4,0xff),tx2=(0x88,0xcc,0xee),tx3=(0x40,0x88,0xaa),
-                              card=(0x04,0x14,0x28),stripe=(0x00,0xb4,0xd8)),
-            "forest":    dict(bg1=(0x04,0x12,0x06),bg2=(0x06,0x1e,0x0a),
-                              a1=(0x2d,0xa4,0x4e),a2=(0x14,0x74,0x2e),
-                              tx=(0xe8,0xff,0xec),tx2=(0x7c,0xcc,0x90),tx3=(0x3a,0x88,0x4e),
-                              card=(0x06,0x18,0x08),stripe=(0x2d,0xa4,0x4e)),
-            "sunset":    dict(bg1=(0x16,0x05,0x03),bg2=(0x26,0x08,0x00),
-                              a1=(0xf5,0x6e,0x1a),a2=(0xed,0x3a,0x7c),
-                              tx=(0xff,0xf0,0xe8),tx2=(0xee,0xcc,0xaa),tx3=(0xb0,0x78,0x58),
-                              card=(0x22,0x08,0x04),stripe=(0xf5,0x6e,0x1a)),
-            "corporate": dict(bg1=(0x1e,0x27,0x61),bg2=(0x0d,0x14,0x3b),
-                              a1=(0xca,0xdc,0xfc),a2=(0x2a,0x7a,0xff),
-                              tx=(0xff,0xff,0xff),tx2=(0xcc,0xdd,0xff),tx3=(0x80,0xa0,0xcc),
-                              card=(0x16,0x1e,0x50),stripe=(0xca,0xdc,0xfc)),
-            "midnight":  dict(bg1=(0x00,0x00,0x00),bg2=(0x08,0x08,0x10),
-                              a1=(0xe0,0xe0,0xff),a2=(0x80,0x80,0xcc),
-                              tx=(0xff,0xff,0xff),tx2=(0xcc,0xcc,0xdd),tx3=(0x70,0x70,0x88),
-                              card=(0x0c,0x0c,0x18),stripe=(0xe0,0xe0,0xff)),
-            "berry":     dict(bg1=(0x12,0x06,0x14),bg2=(0x1e,0x08,0x22),
-                              a1=(0xa2,0x67,0x69),a2=(0x6d,0x2e,0x46),
-                              tx=(0xec,0xe2,0xd0),tx2=(0xd4,0xb8,0xa8),tx3=(0x90,0x70,0x68),
-                              card=(0x1a,0x0a,0x1e),stripe=(0xa2,0x67,0x69)),
-            "terracotta":dict(bg1=(0x1a,0x08,0x06),bg2=(0x28,0x0e,0x08),
-                              a1=(0xb8,0x50,0x42),a2=(0xa7,0xbe,0xae),
-                              tx=(0xf5,0xf0,0xe8),tx2=(0xe4,0xcc,0xb8),tx3=(0xa0,0x84,0x70),
-                              card=(0x22,0x0c,0x08),stripe=(0xb8,0x50,0x42)),
-            "teal":      dict(bg1=(0x02,0x10,0x12),bg2=(0x04,0x1a,0x1e),
-                              a1=(0x02,0x80,0x90),a2=(0x00,0xa8,0x96),
-                              tx=(0xe8,0xfe,0xfc),tx2=(0x80,0xd8,0xcc),tx3=(0x40,0x90,0x88),
-                              card=(0x04,0x14,0x18),stripe=(0x02,0xc3,0x9a)),
-            "cherry":    dict(bg1=(0x0a,0x00,0x02),bg2=(0x16,0x00,0x04),
-                              a1=(0x99,0x00,0x11),a2=(0xcc,0x22,0x22),
-                              tx=(0xfc,0xf6,0xf5),tx2=(0xee,0xcc,0xcc),tx3=(0xa0,0x70,0x70),
-                              card=(0x14,0x02,0x04),stripe=(0x99,0x00,0x11)),
-            "sage":      dict(bg1=(0x06,0x10,0x0c),bg2=(0x0a,0x1a,0x14),
-                              a1=(0x84,0xb5,0x9f),a2=(0x69,0xa2,0x97),
-                              tx=(0xf0,0xf8,0xf4),tx2=(0xaa,0xcc,0xbe),tx3=(0x60,0x90,0x80),
-                              card=(0x08,0x14,0x10),stripe=(0x84,0xb5,0x9f)),
+            "dark":      dict(bg1=(0x04,0x06,0x14), bg2=(0x06,0x0c,0x24),
+                              a1=(0x1a,0x6e,0xf5), a2=(0x7c,0x3a,0xed),
+                              tx=(0xff,0xff,0xff), tx2=(0xb0,0xcc,0xee), tx3=(0x60,0x90,0xb8)),
+            "light":     dict(bg1=(0xf5,0xf7,0xff), bg2=(0xe8,0xed,0xff),
+                              a1=(0x1a,0x6e,0xf5), a2=(0x7c,0x3a,0xed),
+                              tx=(0x08,0x0c,0x28), tx2=(0x28,0x40,0x80), tx3=(0x60,0x80,0xb8)),
+            "ocean":     dict(bg1=(0x02,0x0e,0x1c), bg2=(0x04,0x18,0x2e),
+                              a1=(0x00,0xb4,0xd8), a2=(0x00,0x77,0xb6),
+                              tx=(0xe8,0xf4,0xff), tx2=(0x88,0xcc,0xee), tx3=(0x40,0x88,0xaa)),
+            "forest":    dict(bg1=(0x04,0x12,0x06), bg2=(0x06,0x1e,0x08),
+                              a1=(0x2d,0xa4,0x4e), a2=(0x14,0x74,0x2e),
+                              tx=(0xe8,0xff,0xec), tx2=(0x7c,0xcc,0x90), tx3=(0x3a,0x88,0x4e)),
+            "sunset":    dict(bg1=(0x16,0x05,0x03), bg2=(0x26,0x08,0x00),
+                              a1=(0xf5,0x6e,0x1a), a2=(0xed,0x3a,0x7c),
+                              tx=(0xff,0xf0,0xe8), tx2=(0xee,0xcc,0xaa), tx3=(0xb0,0x78,0x58)),
+            "corporate": dict(bg1=(0x04,0x04,0x0e), bg2=(0x08,0x08,0x1c),
+                              a1=(0x2a,0x7a,0xff), a2=(0x5a,0x2a,0xd0),
+                              tx=(0xff,0xff,0xff), tx2=(0xcc,0xdd,0xff), tx3=(0x80,0xa0,0xcc)),
         }
         C  = THEMES.get(theme, THEMES["dark"])
         def rgb(*t): return RGBColor(*t)
         BG1=rgb(*C["bg1"]); BG2=rgb(*C["bg2"])
         A1=rgb(*C["a1"]);   A2=rgb(*C["a2"])
         TX=rgb(*C["tx"]);   TX2=rgb(*C["tx2"]); TX3=rgb(*C["tx3"])
-        CARD=rgb(*C["card"]); STRIPE=rgb(*C["stripe"])
 
-        # ── Parse slides ──────────────────────────────────────────────────────
+        # ── Parse slides ──────────────────────────────────────────────────
         slides_raw = [s.strip() for s in _re3.split(r'(?m)\n---+\n|^---+$', md) if s.strip()]
         if not slides_raw:
             slides_raw = [md.strip() or "Slide 1"]
         total = len(slides_raw)
 
         prs = Presentation()
-        prs.slide_width  = Inches(W)
-        prs.slide_height = Inches(H)
-        blank = prs.slide_layouts[6]
+        prs.slide_width  = Inches(13.33)
+        prs.slide_height = Inches(7.5)
+        blank = prs.slide_layouts[6]   # completely blank
 
-        # ── Helpers ────────────────────────────────────────────────────────────
+        # ── Shared helpers ────────────────────────────────────────────────
         def _grad(fill, c1, c2, angle=270):
             fill.gradient()
             fill.gradient_stops[0].position = 0.0; fill.gradient_stops[0].color.rgb = c1
@@ -9332,14 +8799,12 @@ async def api_gen_pptx(request: Request):
             fill.gradient_angle = angle
 
         def _bg(slide):
-            _grad(slide.background.fill, BG1, BG2, 210)
+            _grad(slide.background.fill, BG1, BG2, 225)
 
-        def _rect(slide, x, y, w_in, h_emu, *, solid=None, g1=None, g2=None, angle=90, alpha=None):
-            s = slide.shapes.add_shape(1, Inches(x), Inches(y), Inches(w_in), Emu(int(h_emu)))
-            if solid:
-                s.fill.solid(); s.fill.fore_color.rgb = solid
-                if alpha is not None: s.fill.fore_color.transparency = 1.0 - alpha
-            else: _grad(s.fill, g1 or A1, g2 or A2, angle)
+        def _rect(slide, x, y, w_in, h_emu, *, solid=None, g1=None, g2=None, angle=90):
+            s = slide.shapes.add_shape(1, Inches(x), Inches(y), Inches(w_in), Emu(h_emu))
+            if solid: s.fill.solid(); s.fill.fore_color.rgb = solid
+            else:     _grad(s.fill, g1 or A1, g2 or A2, angle)
             s.line.fill.background()
             return s
 
@@ -9358,17 +8823,22 @@ async def api_gen_pptx(request: Request):
             run = par.add_run(); run.text = txt
             run.font.size = Pt(sz); run.font.bold = bold; run.font.italic = italic
             run.font.color.rgb = col or TX
-            run.font.name = "Calibri"
             return bx
 
         def _footer(slide, num, tot):
-            strip = _rect(slide, 0, H-0.38, W, int(0.38*914400), solid=rgb(*[max(0,v-8) for v in C["bg1"]]))
-            nb = slide.shapes.add_textbox(Inches(W-1.4), Inches(H-0.35), Inches(1.3), Inches(0.28))
-            nf = nb.text_frame; np_ = nf.paragraphs[0]; np_.alignment = PP_ALIGN.RIGHT
-            nr = np_.add_run(); nr.text = f"{num} / {tot}"; nr.font.size = Pt(9); nr.font.color.rgb = TX3; nr.font.name="Calibri"
-            lb = slide.shapes.add_textbox(Inches(0.4), Inches(H-0.35), Inches(3), Inches(0.28))
+            # dark strip at bottom
+            strip = _rect(slide, 0, 7.1, 13.33, 55000,
+                          solid=rgb(*[max(0, v-10) for v in C["bg1"]]))
+            # slide number (right)
+            nb = slide.shapes.add_textbox(Inches(11.8), Inches(7.15), Inches(1.4), Inches(0.28))
+            nf = nb.text_frame; np = nf.paragraphs[0]; np.alignment = PP_ALIGN.RIGHT
+            nr = np.add_run(); nr.text = f"{num} / {tot}"
+            nr.font.size = Pt(9); nr.font.color.rgb = TX3
+            # logo (left)  — plain ASCII to avoid emoji issues
+            lb = slide.shapes.add_textbox(Inches(0.4), Inches(7.15), Inches(3), Inches(0.28))
             lf = lb.text_frame; lp = lf.paragraphs[0]
-            lr = lp.add_run(); lr.text = "Fusion.AI"; lr.font.size = Pt(9); lr.font.color.rgb = TX3; lr.font.name="Calibri"
+            lr = lp.add_run(); lr.text = "Fusion.AI"
+            lr.font.size = Pt(9); lr.font.color.rgb = TX3
 
         def _parse(md_txt):
             title = ""; body = []
@@ -9380,13 +8850,15 @@ async def api_gen_pptx(request: Request):
                 else: body.append(s)
             return title, body
 
-        # ── Animation helpers ─────────────────────────────────────────────────
+        # ── Animation (single global counter per presentation) ─────────────
         _id = [200]
         def nid(): _id[0] += 1; return _id[0]
 
         def _anim(slide, pairs):
+            """pairs = list of (shape, delay_ms). Single timing block per slide."""
             if not pairs: return
-            seq_xml = ""; bld_xml = ""
+            seq_xml = ""
+            bld_xml = ""
             for gi, (shp, dms) in enumerate(pairs):
                 sid = shp.shape_id
                 i1=nid(); i2=nid(); i3=nid(); i4=nid(); i5=nid()
@@ -9415,6 +8887,7 @@ async def api_gen_pptx(request: Request):
                     f'</p:childTnLst></p:cTn></p:par>'
                 )
                 bld_xml += f'<p:bldP spid="{sid}" grpId="{gi}" uiExpand="1" build="p"/>'
+
             r1 = nid(); r2 = nid()
             timing = (
                 f'<p:timing xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
@@ -9428,73 +8901,30 @@ async def api_gen_pptx(request: Request):
                 f'<p:bldLst>{bld_xml}</p:bldLst>'
                 f'</p:timing>'
             )
-            try: slide._element.append(etree.fromstring(timing))
-            except Exception as xe: print(f"[pptx anim] {xe}", flush=True)
+            try:
+                slide._element.append(etree.fromstring(timing))
+            except Exception as xe:
+                print(f"[pptx anim] {xe}", flush=True)
 
         def _trans(slide, fx="fade"):
             ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
             xml = f'<p:transition xmlns:p="{ns}" spd="med"><p:{fx}/></p:transition>'
             slide._element.append(etree.fromstring(xml))
 
-        # ── BACKGROUND DESIGN per slide type ─────────────────────────────────
-        # We use varied professional backgrounds instead of a single gradient.
-        # 4 background styles rotate: diagonal-split | corner-panel | full-gradient | layered
-        def _draw_bg_style(slide, si, layout):
-            """Draw a rich professional background. Style rotates per slide."""
-            style = si % 4
-            # Always fill with solid base first
-            slide.background.fill.solid()
-            slide.background.fill.fore_color.rgb = BG1
-
-            if layout in ("title", "closing"):
-                # Bold full-gradient background + large corner shape
-                _grad(slide.background.fill, BG1, BG2, 225)
-                # Large decorative shape bottom-right
-                big = slide.shapes.add_shape(9, Inches(W*0.55), Inches(H*0.3), Inches(W*0.7), Inches(H*0.9))
-                big.fill.solid(); big.fill.fore_color.rgb = A1
-                big.fill.fore_color.transparency = 0.88; big.line.fill.background()
-                # Accent header strip spanning full width
-                hdr = _rect(slide, 0, 0, W, int(H*0.014*914400), g1=A1, g2=A2, angle=0)
-                # Bottom accent strip
-                _rect(slide, 0, H-0.06, W, int(0.06*914400), g1=A2, g2=A1, angle=0)
-            elif style == 0:
-                # Diagonal split: left panel darker + gradient right
-                _grad(slide.background.fill, BG1, BG2, 225)
-                panel = slide.shapes.add_shape(1, Inches(0), Inches(0), Inches(W*0.30), Inches(H))
-                panel.fill.solid(); panel.fill.fore_color.rgb = rgb(*[max(0,v-6) for v in C["bg1"]])
-                panel.fill.fore_color.transparency = 0.0; panel.line.fill.background()
-                # Accent top border
-                hdr = _rect(slide, 0, 0, W, int(0.04*914400), g1=A1, g2=A2, angle=0)
-            elif style == 1:
-                # Corner panel: accent square top-right
-                _grad(slide.background.fill, BG1, BG2, 200)
-                corner = slide.shapes.add_shape(1, Inches(W*0.72), Inches(0), Inches(W*0.28), Inches(H*0.35))
-                _grad(corner.fill, A1, A2, 135); corner.line.fill.background()
-                # Top thin accent line
-                _rect(slide, 0, 0, W, int(0.032*914400), g1=A1, g2=A2, angle=0)
-            elif style == 2:
-                # Full gradient + subtle grid overlay simulation (small shapes)
-                _grad(slide.background.fill, BG1, BG2, 180)
-                # Subtle oval accent shapes (decorative)
-                _oval(slide, W*0.75, -H*0.3, H*0.9, A1, 0.07)
-                _oval(slide, -W*0.1, H*0.5,  H*0.7, A2, 0.06)
-                _rect(slide, 0, 0, W, int(0.036*914400), g1=A1, g2=A2, angle=0)
-            else:
-                # Layered: two tonal rects create depth
-                _grad(slide.background.fill, BG1, BG2, 225)
-                layer = slide.shapes.add_shape(1, Inches(0), Inches(H*0.62), Inches(W), Inches(H*0.38))
-                layer.fill.solid(); layer.fill.fore_color.rgb = rgb(*[max(0,v-4) for v in C["bg2"]])
-                layer.fill.fore_color.transparency = 0.0; layer.line.fill.background()
-                _rect(slide, 0, 0, W, int(0.038*914400), g1=A1, g2=A2, angle=0)
-
-        # ── Render slides ─────────────────────────────────────────────────────
+        # ── Render slides ─────────────────────────────────────────────────
         for si, slide_md in enumerate(slides_raw):
             slide = prs.slides.add_slide(blank)
+            _bg(slide)
             anims = []
+
+            # Background orbs — decorative, no animation (keeps XML simple)
+            _oval(slide, 9.0,  -1.5, 7, A1, 0.09)
+            _oval(slide, -3.0,  3.5, 6, A2, 0.07)
 
             title_txt, body = _parse(slide_md)
             title_txt = title_txt or f"Slide {si+1}"
 
+            # Detect layout
             is_title   = (si == 0)
             is_closing = (si == total-1 and total > 1)
             has_table  = "| " in slide_md and _re3.search(r'\|.+\|', slide_md)
@@ -9508,128 +8938,107 @@ async def api_gen_pptx(request: Request):
                       "data"    if has_table   else
                       "content")
 
-            # Draw rich background
-            _draw_bg_style(slide, si, layout)
+            # Left accent bar (all slides)
+            bar = _rect(slide, 0, 0, 0.07, int(7.5*914400), g1=A1, g2=A2, angle=90)
+            anims.append((bar, 0))
 
-            # ── TITLE layout ─────────────────────────────────────────────────
+            # ── TITLE layout ──────────────────────────────────────────────
             if layout == "title":
-                # Big title centered
-                t = _tb(slide, W*0.07, H*0.28, W*0.86, H*0.35, title_txt,
-                        min(52, max(36, int(52 - max(0, len(title_txt)-30)*0.4))),
-                        bold=True, align=PP_ALIGN.LEFT)
+                # Gradient overlay (bottom half)
+                ov = slide.shapes.add_shape(1, Inches(0), Inches(3.6), Inches(13.33), Inches(3.9))
+                _grad(ov.fill, rgb(*[max(0,v-6) for v in C["bg2"]]), BG1, 270)
+                ov.line.fill.background()
+
+                t = _tb(slide, 1.2, 1.3, 11.0, 2.0, title_txt, 48, bold=True)
                 anims.append((t, 0))
-                # Divider line
-                div = _rect(slide, W*0.07, H*0.64, W*0.38, int(0.04*914400), g1=A1, g2=A2, angle=0)
+
+                div = _rect(slide, 1.2, 3.2, 4.5, 38000, g1=A1, g2=A2, angle=0)
                 anims.append((div, 160))
+
                 if body:
-                    sub = "  ·  ".join(b.lstrip("-*•·> ") for b in body[:3] if b.lstrip("-*•·> "))
+                    sub = "  |  ".join(b.lstrip("-*• ") for b in body[:2] if b.lstrip("-*• "))
                     if sub:
-                        s2 = _tb(slide, W*0.07, H*0.69, W*0.8, H*0.14, sub, 18, col=TX2)
+                        s2 = _tb(slide, 1.2, 3.5, 10.0, 0.8, sub, 18, col=TX2)
                         anims.append((s2, 320))
+
                 _trans(slide, "fade")
 
-            # ── SECTION layout ────────────────────────────────────────────────
+            # ── SECTION layout ────────────────────────────────────────────
             elif layout == "section":
-                cent = _tb(slide, W*0.08, H*0.3, W*0.84, H*0.4, title_txt, 40,
-                           bold=True, align=PP_ALIGN.CENTER)
+                cent = _tb(slide, 0.8, 2.4, 11.7, 1.8, title_txt, 42, bold=True,
+                            align=PP_ALIGN.CENTER)
                 anims.append((cent, 0))
-                div = _rect(slide, W*0.3, H*0.72, W*0.4, int(0.038*914400), g1=A1, g2=A2, angle=0)
+                div = _rect(slide, 4.2, 4.1, 5.0, 36000, g1=A1, g2=A2, angle=0)
                 anims.append((div, 160))
                 _trans(slide, "push")
 
-            # ── CLOSING layout ────────────────────────────────────────────────
+            # ── CLOSING layout ────────────────────────────────────────────
             elif layout == "closing":
-                t2 = _tb(slide, W*0.07, H*0.22, W*0.86, H*0.35, title_txt, 46,
-                         bold=True, align=PP_ALIGN.CENTER)
+                ov2 = slide.shapes.add_shape(1, Inches(0), Inches(2.5), Inches(13.33), Inches(5.0))
+                _grad(ov2.fill, rgb(*[max(0,v-4) for v in C["bg2"]]), BG1, 270)
+                ov2.line.fill.background()
+
+                t2 = _tb(slide, 1.2, 1.5, 11.0, 1.8, title_txt, 44, bold=True,
+                          align=PP_ALIGN.CENTER)
                 anims.append((t2, 0))
-                div2 = _rect(slide, W*0.25, H*0.6, W*0.5, int(0.038*914400), g1=A1, g2=A2, angle=0)
+                div2 = _rect(slide, 3.5, 3.35, 6.5, 36000, g1=A1, g2=A2, angle=0)
                 anims.append((div2, 160))
                 if body:
-                    sub2 = " ".join(b.lstrip("-*•·> ") for b in body[:2] if b.lstrip("-*•·> "))
+                    sub2 = " ".join(b.lstrip("-*• ") for b in body[:2] if b.lstrip("-*• "))
                     if sub2:
-                        sb = _tb(slide, W*0.1, H*0.67, W*0.8, H*0.12, sub2, 17,
-                                 col=TX2, align=PP_ALIGN.CENTER)
+                        sb = _tb(slide, 1.5, 3.75, 10.3, 0.7, sub2, 17,
+                                  col=TX2, align=PP_ALIGN.CENTER)
                         anims.append((sb, 300))
                 _trans(slide, "fade")
 
-            # ── DATA (table) layout ───────────────────────────────────────────
+            # ── DATA (table) layout ───────────────────────────────────────
             elif layout == "data":
-                ht = _tb(slide, W*0.06, H*0.05, W*0.88, H*0.13, title_txt, 26, bold=True)
+                ht = _tb(slide, 0.9, 0.3, 11.5, 0.9, title_txt, 28, bold=True)
                 anims.append((ht, 0))
-                hd = _rect(slide, W*0.06, H*0.18, W*0.4, int(0.032*914400), solid=A1)
+                hd = _rect(slide, 0.9, 1.15, 5.0, 28000, solid=A1)
                 anims.append((hd, 80))
-                tbl_rows = [ln for ln in body if "|" in ln and not _re3.match(r'^\|[-\s|]+\|$', ln)]
-                y = H*0.22
-                row_h = min(0.44, (H*0.68) / max(len(tbl_rows[:9]), 1))
+
+                tbl_rows = [ln for ln in body
+                            if "|" in ln and not _re3.match(r'^\|[-\s|]+\|$', ln)]
+                y = 1.42
                 for ri, row in enumerate(tbl_rows[:9]):
                     cells = [c.strip() for c in row.strip("|").split("|")]
                     row_str = "    ".join(cells)
                     is_h = (ri == 0)
-                    rc_raw = [min(255,v+14) for v in C["bg2"]] if ri%2==0 else list(C["bg2"])
-                    rb = _rect(slide, W*0.06, y, W*0.88, int(row_h*914400),
-                               solid=rgb(*rc_raw))
+                    rc = rgb(*[min(255,v+14) for v in C["bg2"]]) if ri%2==0 else BG2
+                    rb = _rect(slide, 0.9, y, 11.5, int(0.42*914400), solid=rc)
                     anims.append((rb, 90+ri*55))
-                    rt = _tb(slide, W*0.08, y+0.03, W*0.84, row_h-0.06, row_str, 13,
-                             bold=is_h, col=TX if is_h else TX2)
+                    rt = _tb(slide, 1.0, y+0.03, 11.3, 0.37, row_str, 13,
+                              bold=is_h, col=TX if is_h else TX2)
                     anims.append((rt, 110+ri*55))
-                    y += row_h
-                    if y > H-0.45: break
+                    y += 0.42
+                    if y > 6.6: break
                 _trans(slide, "fade")
 
-            # ── CONTENT layout ────────────────────────────────────────────────
+            # ── CONTENT (default) layout ──────────────────────────────────
             else:
-                # Two-column layout when 4+ bullets, single-column otherwise
-                multi_col = len([b for b in body if b.strip()]) >= 4
-                title_sz = min(34, max(22, int(34 - max(0, len(title_txt)-40)*0.3)))
-                ht = _tb(slide, W*0.06, H*0.05, W*0.88, H*0.16, title_txt, title_sz, bold=True)
+                ht = _tb(slide, 0.9, 0.3, 11.5, 0.95, title_txt, 30, bold=True)
                 anims.append((ht, 0))
-                hd = _rect(slide, W*0.06, H*0.21, W*0.44, int(0.028*914400), g1=A1, g2=A2, angle=0)
+                hd = _rect(slide, 0.9, 1.2, 6.0, 30000, g1=A1, g2=A2, angle=0)
                 anims.append((hd, 80))
 
-                clean_body = []
-                for b in body:
-                    cl = _re3.sub(r'\*\*(.+?)\*\*', r'\1', b)
-                    cl = _re3.sub(r'\*(.+?)\*', r'\1', cl)
-                    if cl.strip(): clean_body.append(cl)
-
-                if multi_col:
-                    # Left column
-                    left_items = clean_body[:len(clean_body)//2 + len(clean_body)%2]
-                    right_items = clean_body[len(clean_body)//2 + len(clean_body)%2:]
-                    col_x = [W*0.06, W*0.53]; col_items = [left_items, right_items]
-                    delay = 200
-                    for ci, (cx, items) in enumerate(zip(col_x, col_items)):
-                        y = H*0.27
-                        for bi, bl in enumerate(items[:5]):
-                            is_bul = bl[:1] in "-*•·>"
-                            txt = bl.lstrip("-*•·> ").strip()
-                            if not txt: continue
-                            # Card background for each bullet
-                            card_h = 0.62
-                            card = _rect(slide, cx-0.02, y-0.04, W*0.42, int(card_h*914400),
-                                        solid=CARD, alpha=0.85)
-                            # Left accent mini-bar on card
-                            acc = _rect(slide, cx-0.02, y-0.04, 0.06, int(card_h*914400),
-                                       g1=A1, g2=A2, angle=90)
-                            bt = _tb(slide, cx+0.1, y, W*0.38, 0.55, txt, 14, col=TX2)
-                            anims.append((card, delay)); anims.append((acc, delay+20)); anims.append((bt, delay+40))
-                            y += card_h + 0.06; delay += 120
-                            if y > H-0.55: break
-                else:
-                    y = H*0.28; delay = 200
-                    for bi, bl in enumerate(clean_body[:7]):
-                        is_bul = bl[:1] in "-*•·>"
-                        txt = bl.lstrip("-*•·> ").strip()
-                        if not txt: continue
-                        card_h = 0.55
-                        card = _rect(slide, W*0.06-0.02, y-0.04, W*0.88, int(card_h*914400),
-                                    solid=CARD, alpha=0.85)
-                        acc = _rect(slide, W*0.06-0.02, y-0.04, 0.06, int(card_h*914400),
-                                   g1=A1, g2=A2, angle=90)
-                        bt = _tb(slide, W*0.1, y, W*0.82, 0.48, txt, 15, col=TX2)
-                        anims.append((card, delay)); anims.append((acc, delay+20)); anims.append((bt, delay+40))
-                        y += card_h + 0.06; delay += 140
-                        if y > H-0.52: break
+                y = 1.62; delay = 200
+                for bi, bl in enumerate(body[:8]):
+                    clean = _re3.sub(r'\*\*(.+?)\*\*', r'\1', bl)
+                    clean = _re3.sub(r'\*(.+?)\*',     r'\1', clean)
+                    is_bul = clean[:1] in "-*•·>"
+                    txt = clean.lstrip("-*•·> ").strip()
+                    if not txt: continue
+                    if is_bul:
+                        dot = _rect(slide, 0.9, y+0.12, 0.05, int(0.09*914400), solid=A1)
+                        anims.append((dot, delay-60))
+                        bt = _tb(slide, 1.08, y, 11.1, 0.55, txt, 17, col=TX2)
+                    else:
+                        bt = _tb(slide, 0.9, y, 11.3, 0.55, txt, 17,
+                                  bold=(bi==0), col=TX2)
+                    anims.append((bt, delay))
+                    y += 0.58; delay += 170
+                    if y > 6.7: break
                 _trans(slide, "push")
 
             _footer(slide, si+1, total)
@@ -9646,7 +9055,6 @@ async def api_gen_pptx(request: Request):
     except Exception as ex:
         import traceback as _tb2; _tb2.print_exc()
         return JSONResponse({"error": str(ex)}, status_code=500)
-
 
 @app.post("/api/gen_xlsx")
 async def api_gen_xlsx(request: Request):
@@ -9714,504 +9122,280 @@ async def api_gen_docx(request: Request):
     except Exception as ex:
         return JSONResponse({"error":str(ex)},status_code=500)
 
-# ── SVG / Free Image Gen ──────────────────────────────────────────────────────
-@app.post("/api/gen_svg_img")
-async def api_gen_svg_img(request: Request):
-    auth_user(request)
-    d = await request.json()
-    prompt   = d.get("prompt","").strip()
-    style    = d.get("style","detailed illustration")
-    width    = int(d.get("width",800))
-    height   = int(d.get("height",600))
-    if not prompt: return J({"error":"prompt required"})
 
-    sys_p = f"""You are an expert SVG artist. Generate a single, stunning, richly detailed SVG image.
+# ════════════════════════════════════════════════════════════════════════════
+# FusionOS — sandboxed AI desktop (Terminal, Files, Editor, Agent, Browser, Monitor)
+# ════════════════════════════════════════════════════════════════════════════
+import tempfile as _tf, shutil as _sh, platform as _plat, concurrent.futures as _cf2
 
-RULES:
-- Output ONLY raw SVG code. Start with <svg and end with </svg>. Absolutely nothing else.
-- Use viewBox="0 0 {width} {height}" and width="{width}" height="{height}".
-- Use rich gradients (<linearGradient>, <radialGradient>), complex shapes, layering, and depth.
-- Include <defs> with gradients, filters, patterns as needed for visual richness.
-- The image should look like a professional {style}. Be creative and visually impressive.
-- Use many colors, detailed paths, decorative elements. Make it look like real artwork.
-- No placeholder text, no copyright watermarks. Pure visual art only.
-- The SVG must be complete and valid — all tags opened and closed properly."""
-
-    user_p = f"Create a {style} of: {prompt}"
-
-    key = GROQ_KEY.strip() or OPENROUTER_KEY.strip()
-    if not key: return J({"error":"No LLM API key configured (GROQ_KEY or OPENROUTER_KEY)"})
-
-    ep  = "https://api.groq.com/openai/v1/chat/completions" if GROQ_KEY.strip() else "https://openrouter.ai/api/v1/chat/completions"
-    mdl = "meta-llama/llama-4-maverick-17b-128e-instruct" if GROQ_KEY.strip() else "meta-llama/llama-3.3-70b-instruct:free"
-    hdrs = {"Authorization":f"Bearer {key}","Content-Type":"application/json"}
-    if "openrouter" in ep: hdrs["HTTP-Referer"] = "https://huggingface.co/spaces"
-
-    try:
-        r = req.post(ep, headers=hdrs, json={
-            "model": mdl,
-            "messages": [{"role":"system","content":sys_p},{"role":"user","content":user_p}],
-            "max_tokens": 4096, "temperature": 0.9
-        }, timeout=45)
-        if not r.ok: return J({"error": f"LLM error {r.status_code}: {r.text[:200]}"})
-        raw = r.json()["choices"][0]["message"]["content"].strip()
-        # Extract SVG block
-        import re as _re4
-        m = _re4.search(r'(<svg[\s\S]*?</svg>)', raw, _re4.IGNORECASE)
-        svg = m.group(1) if m else raw
-        # Ensure width/height set
-        if 'viewBox' not in svg:
-            svg = svg.replace('<svg', f'<svg viewBox="0 0 {width} {height}"', 1)
-        return J({"svg": svg, "width": width, "height": height})
-    except Exception as ex:
-        import traceback; traceback.print_exc()
-        return J({"error": str(ex)})
-
-
-# ── AI Computer (Perplexity-style) ─────────────────────────────────────────────
-@app.post("/api/computer")
-async def api_computer(request: Request):
-    import urllib.parse as _up, re as _re5, time as _t5
-    auth_user(request)
-    d        = await request.json()
-    query    = d.get("query","").strip()
-    depth    = d.get("depth","normal")
-    num_src  = int(d.get("num_sources", 6))
-    if not query: return J({"error":"query required"})
-
-    t0 = _t5.time()
-    sources = []
-
-    # ── Step 1: DDG Instant Answer ──────────────────────────────────────────
-    try:
-        ia_url = f"https://api.duckduckgo.com/?q={_up.quote(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1"
-        ia = req.get(ia_url, headers={"User-Agent":"FusionAI/2.0"}, timeout=7)
-        if ia.ok:
-            idata = ia.json()
-            abstract = idata.get("AbstractText","")
-            abs_url  = idata.get("AbstractURL","")
-            abs_src  = idata.get("AbstractSource","")
-            if abstract and abs_url:
-                sources.append({"title": abs_src or "Wikipedia", "url": abs_url,
-                                 "snippet": abstract[:600], "full": abstract})
-    except: pass
-
-    # ── Step 2: Scrape DDG HTML results ────────────────────────────────────
-    try:
-        html_url = f"https://html.duckduckgo.com/html/?q={_up.quote(query)}"
-        hr = req.get(html_url, headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124","Accept-Language":"en-US,en;q=0.9"}, timeout=10)
-        if hr.ok:
-            html = hr.text
-            titles  = _re5.findall(r'class="result__a"[^>]*>([^<]+)</a>', html)
-            raw_urls= _re5.findall(r'uddg=([^&"]+)', html)
-            snips   = _re5.findall(r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>', html, _re5.DOTALL)
-            for i in range(min(len(titles), num_src + 3)):
-                title   = titles[i].strip() if i < len(titles) else ""
-                raw_url = _up.unquote(raw_urls[i]) if i < len(raw_urls) else ""
-                snippet = _re5.sub(r"<[^>]+>","", snips[i]).strip() if i < len(snips) else ""
-                if title and raw_url and raw_url.startswith("http"):
-                    # dedupe
-                    if not any(s["url"]==raw_url for s in sources):
-                        sources.append({"title":title,"url":raw_url,"snippet":snippet[:400],"full":snippet})
-    except: pass
-
-    # ── Step 3: Fetch page content for top sources ──────────────────────────
-    fetch_limit = {"fast":2,"normal":3,"deep":5}.get(depth,3)
-    skip_domains = ["youtube.com","reddit.com","facebook.com","twitter.com","instagram.com","tiktok.com"]
-    fetched = 0
-    for src in sources:
-        if fetched >= fetch_limit: break
-        url = src["url"]
-        if any(d in url for d in skip_domains): continue
-        try:
-            pr = req.get(url, headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept":"text/html"},
-                         timeout=8, allow_redirects=True)
-            if pr.ok and "text/html" in pr.headers.get("Content-Type",""):
-                raw_html = pr.text
-                # Extract visible text
-                text = _re5.sub(r'<script[^>]*>[\s\S]*?</script>','', raw_html, flags=_re5.IGNORECASE)
-                text = _re5.sub(r'<style[^>]*>[\s\S]*?</style>','', text, flags=_re5.IGNORECASE)
-                text = _re5.sub(r'<[^>]+>','', text)
-                text = _re5.sub(r'\s+',' ', text).strip()
-                if len(text) > 200:
-                    src["full"] = text[:3000]
-                    fetched += 1
-        except: pass
-
-    sources = sources[:num_src]
-
-    # ── Step 4: Build context & call LLM for synthesis ──────────────────────
-    ctx_parts = []
-    for i, src in enumerate(sources, 1):
-        ctx_parts.append(f"[{i}] {src['title']} ({src['url']})\n{src.get('full', src.get('snippet',''))[:1200]}")
-    context = "\n\n---\n\n".join(ctx_parts)
-
-    sys_p = f"""You are an AI research assistant like Perplexity. Today is {_now_str()} UTC.
-Given web sources, write a comprehensive, well-structured answer to the user's question.
-
-FORMATTING:
-- Use markdown: ## headings, **bold** key facts, bullet lists, tables when comparing.
-- After each claim cite the source with [n] notation matching the source number.
-- Be specific — include numbers, dates, names from the sources.
-- End with a brief "**Summary**" section if the answer is long.
-- Do NOT mention "the sources say" or "according to [1]" — just cite inline like [1].
-- Write at least 200 words, up to 600. Be thorough but not padded."""
-
-    user_p = f"Question: {query}\n\nSources:\n{context}\n\nWrite a comprehensive cited answer:"
-
-    answer = ""
-    key = GROQ_KEY.strip() or OPENROUTER_KEY.strip()
-    if key:
-        ep  = "https://api.groq.com/openai/v1/chat/completions" if GROQ_KEY.strip() else "https://openrouter.ai/api/v1/chat/completions"
-        mdl = "llama-3.3-70b-versatile" if GROQ_KEY.strip() else "meta-llama/llama-3.3-70b-instruct:free"
-        hdrs = {"Authorization":f"Bearer {key}","Content-Type":"application/json"}
-        if "openrouter" in ep: hdrs["HTTP-Referer"] = "https://huggingface.co/spaces"
-        try:
-            r = req.post(ep, headers=hdrs, json={
-                "model": mdl,
-                "messages":[{"role":"system","content":sys_p},{"role":"user","content":user_p}],
-                "max_tokens": 1500, "temperature": 0.3
-            }, timeout=30)
-            if r.ok: answer = r.json()["choices"][0]["message"]["content"].strip()
-        except: pass
-
-    if not answer and sources:
-        # Fallback: just format snippets
-        answer = f"## Results for: {query}\n\n"
-        for i, s in enumerate(sources,1):
-            answer += f"**[{i}] {s['title']}**\n{s.get('snippet','')}\n\n"
-
-    # ── Step 5: Generate related questions ─────────────────────────────────
-    related = []
-    try:
-        rp = _call_overseer(
-            "You generate exactly 3 follow-up search questions based on a query. Return ONLY a JSON array of 3 short question strings. No markdown, no explanation.",
-            f"Query: {query}",
-            max_tokens=120, cheap=True
-        )
-        if rp:
-            import json as _jj
-            clean = _re5.sub(r'```[a-z]*','', rp).strip().strip('`')
-            related = _jj.loads(clean) if clean.startswith('[') else []
-    except: pass
-
-    elapsed = int((_t5.time() - t0) * 1000)
-    return J({"answer": answer, "sources": sources, "related": related, "elapsed_ms": elapsed})
-
-
-def _now_str():
-    from datetime import datetime
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# FusionOS — sandboxed VM (per-user dir) + Terminal/Files/Editor/Agent/Monitor
-# ══════════════════════════════════════════════════════════════════════════
-FOS_ROOT = os.path.join(tempfile.gettempdir(), "fusionos_sandboxes")
-os.makedirs(FOS_ROOT, exist_ok=True)
-
-_FOS_BLOCKED = [
-    "rm -rf /","rm -rf /*","rm -rf ~","rm -rf .. ",":(){:|:&};:","mkfs",
-    "dd if=/dev/zero","dd if=/dev/random","> /dev/sda","shutdown","reboot",
-    "poweroff","sudo rm","sudo su","chmod -R 777 /","chown -R","mv / ",
-    "wget http://169.254","curl http://169.254","/etc/shadow","/etc/passwd",
-    "iptables","mkfs.ext4",":(){ :|:& };:",
-]
+_FOS_ROOT = os.path.join(_tf.gettempdir(), "fusionos_sandboxes")
+os.makedirs(_FOS_ROOT, exist_ok=True)
+_FOS_BLOCKED = ["rm -rf /","rm -rf /*",":(){ :|:& };:","mkfs","dd if=/dev/zero",
+                 "dd if=/dev/random","> /dev/sda","shutdown","reboot","poweroff",
+                 "chmod -R 777 /","wget http://169.254","curl http://169.254"]
+_SERVER_START = _time.time()
 
 def _fos_sandbox(uid):
-    d = os.path.join(FOS_ROOT, str(uid))
+    d = os.path.join(_FOS_ROOT, str(uid))
     os.makedirs(d, exist_ok=True)
-    welcome = os.path.join(d, "welcome.txt")
-    if not os.path.exists(welcome):
-        try:
-            with open(welcome, "w") as f:
-                f.write(
-                    "Welcome to FusionOS 👋\n\n"
-                    "This is your personal sandboxed Linux environment, running inside Fusion.AI.\n\n"
-                    "• Terminal  — run real shell commands (curl, python3, pip, node, npm, git, gcc...)\n"
-                    "• Files     — browse, create, rename and delete files & folders\n"
-                    "• Editor    — edit code/text with save + one-click run support\n"
-                    "• AI Agent  — give it a goal in plain English and it will autonomously\n"
-                    "              plan and run commands to complete it for you\n"
-                    "• Monitor   — live stats about your sandbox\n\n"
-                    "Languages available: Python3, Node.js, Bash, curl, git, gcc/g++, and anything\n"
-                    "installable via pip/npm (no sudo needed).\n\n"
-                    "Try in the Terminal:\n"
-                    "  curl -s https://api.github.com/zen\n"
-                    "  python3 -c \"print(2**10)\"\n"
-                    "  node -e \"console.log('hi')\"\n\n"
-                    "Or give the AI Agent a goal like:\n"
-                    "  \"create a python script that prints the first 20 fibonacci numbers and run it\"\n\n"
-                    "Have fun exploring!\n"
-                )
-        except Exception:
-            pass
+    wf = os.path.join(d, "README.txt")
+    if not os.path.exists(wf):
+        open(wf,"w").write(
+            "Welcome to FusionOS!\n\n"
+            "This is your personal sandboxed Linux environment.\n\n"
+            "Available: python3, pip, node, npm, curl, git, gcc, g++, bash\n\n"
+            "Try in Terminal:\n"
+            "  python3 -c \"print(2**32)\"\n"
+            "  curl -s https://api.github.com/zen\n"
+            "  node -e \"console.log('hello')\"\n\n"
+            "Or use the AI Agent — give it a goal in plain English!\n"
+        )
     return d
 
 def _fos_safe_path(sandbox, rel):
     rel = (rel or "").strip().lstrip("/")
-    target = os.path.normpath(os.path.join(sandbox, rel))
-    if not (target == sandbox or target.startswith(sandbox + os.sep)):
-        target = sandbox
-    return target
+    t = os.path.normpath(os.path.join(sandbox, rel))
+    if not (t == sandbox or t.startswith(sandbox + os.sep)): t = sandbox
+    return t
 
-def _fos_is_blocked(cmd):
+def _fos_blocked(cmd):
     low = cmd.lower()
     for b in _FOS_BLOCKED:
         if b in low: return b
     return None
 
+def _fos_run(cmd, cwd, timeout=30):
+    env = os.environ.copy(); env["HOME"] = cwd; env["TERM"] = "xterm-256color"
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                            text=True, timeout=timeout, env=env)
+        return r.stdout[-6000:], r.stderr[-3000:], r.returncode
+    except subprocess.TimeoutExpired:
+        return "", f"⏱ Timed out ({timeout}s limit — try a shorter command)", 124
+    except Exception as ex:
+        return "", str(ex), 1
 
 @app.post("/api/fos/exec")
 async def api_fos_exec(request: Request):
-    u = auth_user(request)
-    d = await request.json()
-    cmd     = (d.get("cmd") or "").strip()
+    u = auth_user(request); d = await request.json()
+    cmd = (d.get("cmd") or "").strip()
     cwd_rel = (d.get("cwd") or "").strip().lstrip("/")
-    if not cmd: return J({"stdout":"","stderr":"","code":0,"cwd":cwd_rel})
-
     sandbox = _fos_sandbox(u["id"])
-    blocked = _fos_is_blocked(cmd)
-    if blocked:
-        return J({"stdout":"","stderr":f"⛔ Command blocked for safety (contains '{blocked}')","code":1,"cwd":cwd_rel})
-
-    workdir = _fos_safe_path(sandbox, cwd_rel)
-    os.makedirs(workdir, exist_ok=True)
-    low = cmd.lower().strip()
-
-    # 'cd' must be handled specially — subprocess can't persist directory state
+    if not cmd: return J({"stdout":"","stderr":"","code":0,"cwd":cwd_rel})
+    blocked = _fos_blocked(cmd)
+    if blocked: return J({"stdout":"","stderr":f"⛔ Blocked: '{blocked}'","code":1,"cwd":cwd_rel})
+    workdir = _fos_safe_path(sandbox, cwd_rel); os.makedirs(workdir, exist_ok=True)
+    low = cmd.strip().lower()
+    if low in ("clear","cls"): return J({"stdout":"__CLEAR__","stderr":"","code":0,"cwd":cwd_rel})
     if low == "cd" or low.startswith("cd "):
         target = cmd[2:].strip() or "~"
-        if target in ("~","/",""):
-            return J({"stdout":"","stderr":"","code":0,"cwd":""})
+        if target in ("~","","/"): return J({"stdout":"","stderr":"","code":0,"cwd":""})
         newpath = os.path.normpath(os.path.join(workdir, target))
         if not (newpath == sandbox or newpath.startswith(sandbox+os.sep)): newpath = sandbox
-        if not os.path.isdir(newpath):
-            return J({"stdout":"","stderr":f"cd: no such directory: {target}","code":1,"cwd":cwd_rel})
+        if not os.path.isdir(newpath): return J({"stdout":"","stderr":f"cd: {target}: No such directory","code":1,"cwd":cwd_rel})
         newrel = os.path.relpath(newpath, sandbox)
         return J({"stdout":"","stderr":"","code":0,"cwd":"" if newrel=="." else newrel})
-
-    if low in ("clear","cls"):
-        return J({"stdout":"__CLEAR__","stderr":"","code":0,"cwd":cwd_rel})
-
-    try:
-        env = os.environ.copy()
-        env["HOME"] = sandbox; env["TERM"] = "xterm-256color"; env["PS1"]="$ "
-        r = subprocess.run(cmd, shell=True, cwd=workdir, capture_output=True,
-                            text=True, timeout=15, env=env)
-        return J({"stdout": r.stdout[-8000:], "stderr": r.stderr[-4000:],
-                   "code": r.returncode, "cwd": cwd_rel})
-    except subprocess.TimeoutExpired:
-        return J({"stdout":"","stderr":"⏱ Command timed out (15s limit)","code":124,"cwd":cwd_rel})
-    except Exception as ex:
-        return J({"stdout":"","stderr":str(ex),"code":1,"cwd":cwd_rel})
-
+    stdout, stderr, code = _fos_run(cmd, workdir)
+    return J({"stdout": stdout, "stderr": stderr, "code": code, "cwd": cwd_rel})
 
 @app.post("/api/fos/files")
 async def api_fos_files(request: Request):
-    u = auth_user(request)
-    d = await request.json()
-    action = d.get("action","list")
-    rel    = d.get("path","")
-    sandbox = _fos_sandbox(u["id"])
-    target  = _fos_safe_path(sandbox, rel)
+    u = auth_user(request); d = await request.json()
+    action = d.get("action","list"); rel = d.get("path","")
+    sandbox = _fos_sandbox(u["id"]); target = _fos_safe_path(sandbox, rel)
     try:
         if action == "list":
-            if not os.path.isdir(target):
-                target = sandbox; rel = ""
+            if not os.path.isdir(target): target = sandbox; rel = ""
             items = []
-            for name in sorted(os.listdir(target), key=lambda n: (not os.path.isdir(os.path.join(target,n)), n.lower())):
-                if name.startswith("."): continue
-                fp = os.path.join(target, name)
-                is_dir = os.path.isdir(fp)
-                items.append({
-                    "name": name, "is_dir": is_dir,
-                    "size": 0 if is_dir else os.path.getsize(fp),
-                    "mtime": os.path.getmtime(fp),
-                })
-            return J({"items": items, "path": rel.strip("/")})
+            for name in sorted(os.listdir(target), key=lambda n:(not os.path.isdir(os.path.join(target,n)),n.lower())):
+                fp = os.path.join(target, name); is_dir = os.path.isdir(fp)
+                items.append({"name":name,"is_dir":is_dir,"size":0 if is_dir else os.path.getsize(fp),"mtime":int(os.path.getmtime(fp))})
+            return J({"items":items,"path":rel.strip("/")})
         elif action == "read":
             if not os.path.isfile(target): return J({"error":"File not found"})
-            if os.path.getsize(target) > 2_000_000: return J({"error":"File too large to open (>2MB)"})
-            with open(target, "r", errors="replace") as f: content = f.read()
-            return J({"content": content, "path": rel})
+            if os.path.getsize(target) > 2_000_000: return J({"error":"File too large (>2MB)"})
+            return J({"content": open(target,"r",errors="replace").read(), "path": rel})
         elif action == "write":
-            content = d.get("content","")
-            os.makedirs(os.path.dirname(target) or sandbox, exist_ok=True)
-            with open(target, "w") as f: f.write(content)
-            return J({"ok": True})
-        elif action == "mkdir":
-            os.makedirs(target, exist_ok=True)
-            return J({"ok": True})
-        elif action == "new_file":
-            os.makedirs(os.path.dirname(target) or sandbox, exist_ok=True)
-            if not os.path.exists(target):
-                with open(target, "w") as f: f.write("")
-            return J({"ok": True})
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            open(target,"w").write(d.get("content",""))
+            return J({"ok":True})
+        elif action in ("mkdir","new_file"):
+            if action=="mkdir": os.makedirs(target, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(target) or sandbox, exist_ok=True)
+                if not os.path.exists(target): open(target,"w").write("")
+            return J({"ok":True})
         elif action == "delete":
-            if os.path.isdir(target): shutil.rmtree(target, ignore_errors=True)
+            if os.path.isdir(target): _sh.rmtree(target, ignore_errors=True)
             elif os.path.isfile(target): os.remove(target)
-            return J({"ok": True})
+            return J({"ok":True})
         elif action == "rename":
-            new_target = _fos_safe_path(sandbox, d.get("new_path",""))
-            os.makedirs(os.path.dirname(new_target) or sandbox, exist_ok=True)
-            os.rename(target, new_target)
-            return J({"ok": True})
-        else:
-            return J({"error": "Unknown action"})
-    except Exception as ex:
-        return J({"error": str(ex)})
-
+            new_t = _fos_safe_path(sandbox, d.get("new_path",""))
+            os.makedirs(os.path.dirname(new_t) or sandbox, exist_ok=True)
+            os.rename(target, new_t); return J({"ok":True})
+    except Exception as ex: return J({"error": str(ex)})
+    return J({"error":"Unknown action"})
 
 @app.post("/api/fos/agent")
 async def api_fos_agent(request: Request):
-    u = auth_user(request)
-    d = await request.json()
-    goal       = (d.get("goal") or "").strip()
+    u = auth_user(request); d = await request.json()
+    goal = (d.get("goal") or "").strip()
     transcript = d.get("transcript", []) or []
-    step_num   = int(d.get("step", 1))
+    step_num = int(d.get("step", 1))
+    speed = d.get("speed", "balanced")
+    max_steps = max(3, min(20, int(d.get("max_steps", 10))))
     if not goal: return J({"action":"fail","reason":"No goal provided"})
-    if step_num > 14:
-        return J({"action":"done","summary":"Reached the step limit (14). Stopping here — check the output above for progress."})
-
+    if step_num > max_steps:
+        return J({"action":"done","summary":f"Reached the step limit ({max_steps}). Check the output above."})
+    SCFG = {"fast":{"max_tokens":500,"timeout":20,"cheap":True},
+             "balanced":{"max_tokens":900,"timeout":35,"cheap":False},
+             "thorough":{"max_tokens":1400,"timeout":50,"cheap":False}}.get(speed,{"max_tokens":900,"timeout":35,"cheap":False})
     sandbox = _fos_sandbox(u["id"])
-
     hist_txt = ""
-    for i, t in enumerate(transcript[-7:], 1):
-        hist_txt += (f"\nStep {i}: ran `{t.get('cmd','')}`\n"
-                      f"  stdout: {(t.get('stdout','') or '')[:450]}\n"
-                      f"  stderr: {(t.get('stderr','') or '')[:250]}\n"
-                      f"  exit code: {t.get('code')}\n")
+    for i, t in enumerate(transcript[-6:], 1):
+        hist_txt += f"\nStep {i}: ran `{t.get('cmd','')}`\n  stdout: {(t.get('stdout','') or '')[:350]}\n  exit: {t.get('code')}\n"
+    sys_p = f"""You are the FusionOS AI Agent. You run real shell commands in a sandboxed Linux VM.
+Available: python3, pip, node, npm, curl, git, gcc, g++, bash, and standard unix tools. No sudo.
+CWD: {sandbox}
 
-    sys_p = """You are the FusionOS Agent — an autonomous AI that completes tasks by running real shell commands in a sandboxed Linux environment with python3, pip, node, npm, git, curl, gcc/g++, and standard unix tools available (no sudo, no destructive system access).
+Respond with ONLY a single JSON object — no markdown, no explanation outside it:
+{{"action":"run","cmd":"shell command here","explain":"one sentence why"}}
+or when done: {{"action":"done","summary":"what was accomplished"}}
+or if stuck: {{"action":"fail","reason":"why"}}
 
-Given a GOAL and a transcript of commands run so far, decide the SINGLE next shell command to run, or declare the task finished.
-
-Respond with ONLY raw JSON, no markdown fences, no explanation outside the JSON:
-{"action":"run","cmd":"<shell command>","explain":"<short sentence: why this command, shown to the user>"}
-or when the goal has been achieved:
-{"action":"done","summary":"<1-3 sentences summarizing what was accomplished, written for the user>"}
-or if you truly cannot proceed:
-{"action":"fail","reason":"<short reason>"}
-
-Rules:
-- Exactly ONE command per response.
-- To write files, use heredocs: cat > script.py << 'EOF'\\n...\\nEOF
-- CRITICAL: your entire response must be ONE valid JSON object on a single logical value per field. Inside the "cmd" string, escape every literal newline as \\n and every double-quote as \\" — do not paste raw line breaks into the JSON string.
-- Verify your work — e.g. run a script after creating it, or cat a file after writing it.
-- Prefer finishing in 2-6 steps. Once the goal's output is visible/confirmed, respond "done".
-- Never use sudo, rm -rf /, network attacks, or other destructive/unsafe commands."""
-
-    user_p = f"GOAL: {goal}\n\nTRANSCRIPT SO FAR:{hist_txt or ' (none — this is the first step)'}\n\nWhat is the next single command? (planning step {step_num})"
-
-    raw = _call_overseer(sys_p, user_p, max_tokens=900)
-    if not raw:
-        return J({"action":"fail","reason":"AI planning unavailable — no model configured"})
-
-    clean = _re.sub(r'```[a-zA-Z]*', '', raw).strip().strip('`').strip()
-    m = _re.search(r'\{[\s\S]*\}', clean)
-    if m: clean = m.group(0)
-
+CRITICAL: Escape ALL newlines as \\n inside the "cmd" string — never put raw line breaks in JSON.
+To write a file: cmd = "printf 'line1\\nline2\\n' > file.py"  (or use printf, not heredoc)
+Verify work — run scripts after writing them. Finish in 2-8 steps."""
+    user_p = f"GOAL: {goal}\n\nTRANSCRIPT:{hist_txt or ' (first step)'}\n\nStep {step_num}:"
+    raw = _call_overseer(sys_p, user_p, max_tokens=SCFG["max_tokens"], timeout=SCFG["timeout"], cheap=SCFG["cheap"])
+    if not raw: return J({"action":"fail","reason":f"AI model timed out or is unavailable. Try 'Fast' mode or try again."})
+    clean = _re.sub(r'```\w*','',raw).strip().strip('`').strip()
+    m = _re.search(r'\{[\s\S]*\}', clean); clean = m.group(0) if m else clean
     plan = None
-    try:
-        # strict=False allows raw control chars (literal newlines/tabs) inside
-        # JSON string values — common when the model embeds a multi-line
-        # heredoc command without perfectly escaping it as \n.
-        plan = json.loads(clean, strict=False)
-    except Exception:
-        plan = _fos_extract_plan_fallback(clean)
-
-    if plan is None:
-        return J({"action":"fail","reason":"Could not parse the AI's plan this step (malformed response) — try rephrasing the goal or running it again."})
-
+    try: plan = json.loads(clean, strict=False)
+    except:
+        am = _re.search(r'"action"\s*:\s*"(run|done|fail)"', clean)
+        if am:
+            act2 = am.group(1)
+            if act2 == "run":
+                cm = _re.search(r'"cmd"\s*:\s*"((?:[^"\\]|\\.)*)"', clean)
+                em = _re.search(r'"explain"\s*:\s*"((?:[^"\\]|\\.)*)"', clean)
+                if cm: plan = {"action":"run","cmd":cm.group(1).replace('\\n','\n'),"explain": em.group(1) if em else ""}
+            elif act2 == "done":
+                sm = _re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', clean)
+                plan = {"action":"done","summary": sm.group(1) if sm else "Task completed."}
+            else:
+                rm = _re.search(r'"reason"\s*:\s*"((?:[^"\\]|\\.)*)"', clean)
+                plan = {"action":"fail","reason": rm.group(1) if rm else "Agent could not continue."}
+    if plan is None: return J({"action":"fail","reason":"Malformed response from AI — try again or switch speed mode."})
     act = plan.get("action")
     if act == "run":
         cmd = (plan.get("cmd") or "").strip()
-        if not cmd: return J({"action":"fail","reason":"Agent returned an empty command"})
-        blocked = _fos_is_blocked(cmd)
-        if blocked:
-            return J({"action":"fail","reason":f"Blocked unsafe command (contains '{blocked}')"})
-        try:
-            env = os.environ.copy(); env["HOME"] = sandbox; env["TERM"]="xterm"
-            r = subprocess.run(cmd, shell=True, cwd=sandbox, capture_output=True,
-                                text=True, timeout=20, env=env)
-            return J({"action":"run","cmd":cmd,"explain":plan.get("explain",""),
-                       "stdout": r.stdout[-4000:], "stderr": r.stderr[-2000:], "code": r.returncode})
-        except subprocess.TimeoutExpired:
-            return J({"action":"run","cmd":cmd,"explain":plan.get("explain",""),
-                       "stdout":"","stderr":"⏱ Timed out (20s limit)","code":124})
-        except Exception as ex:
-            return J({"action":"run","cmd":cmd,"explain":plan.get("explain",""),
-                       "stdout":"","stderr":str(ex),"code":1})
-    elif act == "done":
-        return J({"action":"done","summary": plan.get("summary","Task completed.")})
-    else:
-        return J({"action":"fail","reason": plan.get("reason","Agent could not complete the task.")})
-
-
-def _fos_extract_plan_fallback(clean):
-    """Last-resort regex extraction for when json.loads fails outright —
-    e.g. an unescaped literal quote inside a heredoc body. Tolerant of
-    raw newlines/quotes inside the cmd/summary/reason string values."""
-    act_m = _re.search(r'"action"\s*:\s*"(run|done|fail)"', clean)
-    if not act_m: return None
-    action = act_m.group(1)
-
-    def _grab(field, after_field=None):
-        # Grab the value of "field":"....." up to the next top-level key or closing brace
-        stop = r'"\s*,\s*"' + after_field if after_field else r'"\s*\}'
-        mm = _re.search(r'"'+field+r'"\s*:\s*"(.*?)' + stop, clean, _re.DOTALL)
-        if not mm:
-            mm = _re.search(r'"'+field+r'"\s*:\s*"(.*)"', clean, _re.DOTALL)
-        if not mm: return None
-        val = mm.group(1)
-        return val.replace('\\n','\n').replace('\\t','\t').replace('\\"','"').replace('\\\\','\\')
-
-    if action == "run":
-        cmd = _grab("cmd", "explain") or _grab("cmd")
-        if not cmd: return None
-        explain = _grab("explain") or ""
-        return {"action":"run","cmd":cmd,"explain":explain}
-    elif action == "done":
-        return {"action":"done","summary": _grab("summary") or "Task completed."}
-    else:
-        return {"action":"fail","reason": _grab("reason") or "Agent could not continue."}
-
+        if not cmd: return J({"action":"fail","reason":"Empty command"})
+        b = _fos_blocked(cmd)
+        if b: return J({"action":"fail","reason":f"Blocked: '{b}'"})
+        stdout, stderr, code = _fos_run(cmd, sandbox, timeout=30)
+        return J({"action":"run","cmd":cmd,"explain":plan.get("explain",""),"stdout":stdout,"stderr":stderr,"code":code})
+    elif act == "done": return J({"action":"done","summary":plan.get("summary","Task completed.")})
+    else: return J({"action":"fail","reason":plan.get("reason","Agent stopped.")})
 
 @app.post("/api/fos/stats")
 async def api_fos_stats(request: Request):
-    u = auth_user(request)
-    sandbox = _fos_sandbox(u["id"])
-    total_size = 0; file_count = 0; dir_count = 0
-    for root, dirs, files in os.walk(sandbox):
-        dir_count += len(dirs)
+    u = auth_user(request); sandbox = _fos_sandbox(u["id"])
+    total_size=0; fc=0; dc=0
+    for root,dirs,files in os.walk(sandbox):
+        dc+=len(dirs)
         for f in files:
-            try:
-                total_size += os.path.getsize(os.path.join(root, f)); file_count += 1
-            except Exception: pass
-    disk_total = disk_used = disk_free = None
+            try: total_size+=os.path.getsize(os.path.join(root,f)); fc+=1
+            except: pass
+    du = _sh.disk_usage(sandbox)
+    return J({"files":fc,"dirs":dc,"size_kb":round(total_size/1024,1),
+               "python":_plat.python_version(),"platform":_plat.platform(),
+               "uptime_s":round(_time.time()-_SERVER_START,1),
+               "disk_total_gb":round(du.total/1e9,1),"disk_used_gb":round(du.used/1e9,1),"disk_free_gb":round(du.free/1e9,1),
+               "groq":bool(GROQ_KEY.strip()),"openrouter":bool(OPENROUTER_KEY.strip())})
+
+# ── AI Computer (Perplexity-style) with parallel page fetch ──────────────────
+@app.post("/api/computer")
+async def api_computer(request: Request):
+    import urllib.parse as _up, re as _re5, time as _t5
+    auth_user(request); d=await request.json()
+    query=d.get("query","").strip(); depth=d.get("depth","normal")
+    num_src=int(d.get("num_sources",6)); t0=_t5.time(); sources=[]
     try:
-        du = shutil.disk_usage(sandbox)
-        disk_total, disk_used, disk_free = du.total, du.used, du.free
-    except Exception: pass
-    return J({
-        "sandbox_files": file_count,
-        "sandbox_dirs": dir_count,
-        "sandbox_size_kb": round(total_size/1024, 1),
-        "python_version": _platform.python_version(),
-        "platform": _platform.platform(),
-        "machine": _platform.machine(),
-        "server_uptime_s": round(_time.time() - _SERVER_START, 1),
-        "disk_total_gb": round(disk_total/1e9,1) if disk_total else None,
-        "disk_used_gb": round(disk_used/1e9,1) if disk_used else None,
-        "disk_free_gb": round(disk_free/1e9,1) if disk_free else None,
-        "models_online": {
-            "groq": bool(GROQ_KEY.strip()),
-            "openrouter": bool(OPENROUTER_KEY.strip()),
-            "github": bool(GITHUB_TOKEN.strip()),
-            "cloudflare": bool(CF_KEY.strip()),
-        },
-    })
+        ia=req.get(f"https://api.duckduckgo.com/?q={_up.quote(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1",
+                    headers={"User-Agent":"FusionAI/2"},timeout=6)
+        if ia.ok:
+            id2=ia.json(); ab=id2.get("AbstractText",""); au=id2.get("AbstractURL","")
+            if ab and au: sources.append({"title":id2.get("AbstractSource","Wikipedia"),"url":au,"snippet":ab[:600],"full":ab})
+    except: pass
+    try:
+        hr=req.get(f"https://html.duckduckgo.com/html/?q={_up.quote(query)}",
+                    headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},timeout=9)
+        if hr.ok:
+            titles=_re5.findall(r'class="result__a"[^>]*>([^<]+)</a>',hr.text)
+            raw_urls=_re5.findall(r'uddg=([^&"]+)',hr.text)
+            snips=_re5.findall(r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>',hr.text,_re5.DOTALL)
+            for i in range(min(len(titles),num_src+3)):
+                t2=titles[i].strip() if i<len(titles) else ""
+                ru=_up.unquote(raw_urls[i]) if i<len(raw_urls) else ""
+                sn=_re5.sub(r"<[^>]+>","",snips[i]).strip() if i<len(snips) else ""
+                if t2 and ru and ru.startswith("http") and not any(s["url"]==ru for s in sources):
+                    sources.append({"title":t2,"url":ru,"snippet":sn[:400],"full":sn})
+    except: pass
+    fetch_n={"fast":2,"normal":3,"deep":5}.get(depth,3); ptmo=6
+    skip=["youtube.com","reddit.com","facebook.com","twitter.com","instagram.com","tiktok.com"]
+    cands=[s for s in sources if not any(sd in s["url"] for sd in skip)][:fetch_n]
+    def _fp(src):
+        try:
+            pr=req.get(src["url"],headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0)","Accept":"text/html"},timeout=ptmo,allow_redirects=True)
+            if pr.ok and "text/html" in pr.headers.get("Content-Type",""):
+                txt=_re5.sub(r'<script[\s\S]*?</script>','',pr.text,flags=_re5.IGNORECASE)
+                txt=_re5.sub(r'<style[\s\S]*?</style>','',txt,flags=_re5.IGNORECASE)
+                txt=_re5.sub(r'<[^>]+>','',txt); txt=_re5.sub(r'\s+',' ',txt).strip()
+                if len(txt)>200: return src["url"],txt[:3000]
+        except: pass
+        return src["url"],None
+    if cands:
+        with _cf2.ThreadPoolExecutor(max_workers=min(5,len(cands))) as pool:
+            futs=[pool.submit(_fp,s) for s in cands]
+            for fut in _cf2.as_completed(futs,timeout=ptmo+2):
+                try:
+                    url,txt=fut.result()
+                    if txt:
+                        for s in sources:
+                            if s["url"]==url: s["full"]=txt; break
+                except: pass
+    sources=sources[:num_src]
+    ctx="\n\n---\n\n".join(f"[{i}] {s['title']} ({s['url']})\n{s.get('full',s.get('snippet',''))[:1200]}" for i,s in enumerate(sources,1))
+    sys_p=f"You are an AI research assistant. Today is {datetime.utcnow().strftime('%Y-%m-%d')} UTC.\nAnswer the question using the web sources. Use markdown. Cite sources inline as [1],[2] etc. Be thorough but concise."
+    ans=_call_overseer(sys_p,f"Question: {query}\n\nSources:\n{ctx}\n\nAnswer:",max_tokens=1400,timeout=40) or ""
+    if not ans and sources: ans="\n\n".join(f"**[{i}] {s['title']}**\n{s.get('snippet','')}" for i,s in enumerate(sources,1))
+    related=[]
+    try:
+        rr=_call_overseer("Return ONLY a JSON array of 3 short follow-up question strings. No markdown.",f"Query: {query}",max_tokens=120,cheap=True,timeout=15)
+        if rr:
+            import json as _jj; clean2=_re.sub(r'```\w*','',rr).strip().strip('`')
+            m2=_re.search(r'\[[\s\S]*\]',clean2)
+            if m2: related=_jj.loads(m2.group(0))
+    except: pass
+    return J({"answer":ans,"sources":sources,"related":related,"elapsed_ms":int((_t5.time()-t0)*1000)})
+
+# ── Free SVG image gen ───────────────────────────────────────────────────────
+@app.post("/api/gen_svg_img")
+async def api_gen_svg_img(request: Request):
+    auth_user(request); d=await request.json()
+    prompt=d.get("prompt","").strip(); style=d.get("style","detailed illustration")
+    w=int(d.get("width",800)); h=int(d.get("height",600))
+    if not prompt: return J({"error":"prompt required"})
+    sys_p=f"""You are an expert SVG artist. Output ONLY raw SVG starting with <svg and ending with </svg>.
+Use viewBox="0 0 {w} {h}" width="{w}" height="{h}". Create rich {style} art with gradients, shapes and vivid color. No text unless asked."""
+    raw=_call_overseer(sys_p,f"Create: {prompt}",max_tokens=4096,timeout=45)
+    if not raw: return J({"error":"LLM unavailable"})
+    m=_re.search(r'(<svg[\s\S]*?</svg>)',raw,_re.IGNORECASE)
+    svg=m.group(1) if m else raw
+    if 'viewBox' not in svg: svg=svg.replace('<svg',f'<svg viewBox="0 0 {w} {h}"',1)
+    return J({"svg":svg})
 
 
 @app.get("/")
