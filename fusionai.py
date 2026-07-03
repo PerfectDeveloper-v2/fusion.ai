@@ -36,6 +36,19 @@ EXTRA_API_KEY  = os.environ.get("EXTRA_API_KEY","")
 EXTRA_API_URL  = os.environ.get("EXTRA_API_URL","")
 HCAPTCHA_SECRET  = os.environ.get("HCAPTCHA_SECRET","")
 HCAPTCHA_SITE_KEY= os.environ.get("HCAPTCHA_SITE_KEY","10000000-ffff-ffff-ffff-000000000001")
+# ── Direct provider API keys ───────────────────────────────────────────────────
+OPENAI_KEY     = os.environ.get("OPENAI_KEY","")        # OpenAI direct
+ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY","")     # Claude / Anthropic
+GEMINI_KEY     = os.environ.get("GEMINI_KEY","")        # Google Gemini
+DEEPSEEK_KEY   = os.environ.get("DEEPSEEK_KEY","")      # DeepSeek direct
+MOONSHOT_KEY   = os.environ.get("MOONSHOT_KEY","")      # Kimi / Moonshot AI
+MISTRAL_KEY    = os.environ.get("MISTRAL_KEY","")       # Mistral AI direct
+XAI_KEY        = os.environ.get("XAI_KEY","")           # xAI Grok
+COHERE_KEY     = os.environ.get("COHERE_KEY","")        # Cohere Command R
+TOGETHER_KEY   = os.environ.get("TOGETHER_KEY","")      # Together AI
+PERPLEXITY_KEY = os.environ.get("PERPLEXITY_KEY","")    # Perplexity Sonar
+# ── CF Worker 2 (gamesdohas — same WORKER_KEY) ────────────────────────────────
+WORKER_URL2    = os.environ.get("WORKER_URL2","https://fusionai.gamesdohas.workers.dev/")
 GITHUB_ENDPOINT= "https://models.github.ai/inference/chat/completions"
 OVERSEER_MODEL = "llama-3.3-70b-versatile"
 OVERSEER_ENHANCE_MODEL = "llama-3.1-8b-instant"  # cheapest for prompt enhancement
@@ -407,7 +420,99 @@ Reply with ONLY the model key. No explanation. No punctuation. Just the key."""
 
 ENDPOINTS={"groq":"https://api.groq.com/openai/v1/chat/completions",
             "openrouter":"https://openrouter.ai/api/v1/chat/completions",
-            "github":GITHUB_ENDPOINT}
+            "github":GITHUB_ENDPOINT,
+            # ── Direct provider APIs (all OpenAI-compatible /chat/completions shape) ──
+            "openai":"https://api.openai.com/v1/chat/completions",
+            "deepseek":"https://api.deepseek.com/v1/chat/completions",
+            "moonshot":"https://api.moonshot.ai/v1/chat/completions",
+            "mistral":"https://api.mistral.ai/v1/chat/completions",
+            "xai":"https://api.x.ai/v1/chat/completions",
+            "together":"https://api.together.xyz/v1/chat/completions",
+            "perplexity":"https://api.perplexity.ai/chat/completions",
+            "cohere":"https://api.cohere.ai/compatibility/v1/chat/completions"}
+            # NOTE: "anthropic" and "gemini" are NOT OpenAI-compatible — they have
+            # dedicated call functions (_call_anthropic_api / _call_gemini_api) below.
+
+# ── Anthropic (Claude) + Google Gemini — non-OpenAI-shaped direct APIs ────────
+def _strip_system(msgs):
+    """Pull system message(s) out of an OpenAI-style messages list."""
+    sys_text=""; out=[]
+    for m in msgs:
+        if m.get("role")=="system": sys_text+=(m.get("content") or "")+"\n"
+        else: out.append(m)
+    return sys_text.strip(), out
+
+def _call_anthropic_api(model,msgs,key,max_tokens=4096,image_b64=None,image_mime=None,timeout=90):
+    """Call Anthropic /v1/messages. Returns (ok, text_or_error)."""
+    sys_text,conv=_strip_system(msgs)
+    amsgs=[]
+    for m in conv:
+        role=m.get("role")
+        if role not in ("user","assistant"): continue
+        content=m.get("content")
+        if isinstance(content,str): amsgs.append({"role":role,"content":content})
+        elif isinstance(content,list):
+            blocks=[{"type":"text","text":c.get("text","")} for c in content if isinstance(c,dict) and c.get("type")=="text"]
+            amsgs.append({"role":role,"content":blocks or [{"type":"text","text":""}]})
+        else: amsgs.append({"role":role,"content":str(content)})
+    if image_b64 and amsgs:
+        for m in reversed(amsgs):
+            if m["role"]=="user":
+                txt=m["content"] if isinstance(m["content"],str) else "".join(b.get("text","") for b in m["content"] if isinstance(b,dict))
+                m["content"]=[{"type":"image","source":{"type":"base64","media_type":image_mime or "image/jpeg","data":image_b64}},{"type":"text","text":txt}]
+                break
+    if not amsgs: amsgs=[{"role":"user","content":"Hello"}]
+    body={"model":model,"max_tokens":max_tokens,"messages":amsgs}
+    if sys_text: body["system"]=sys_text
+    try:
+        r=req.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key":key,"anthropic-version":"2023-06-01","content-type":"application/json"},
+            json=body,timeout=timeout)
+        if not r.ok:
+            try: em=r.json().get("error",{}).get("message",r.text[:200])
+            except: em=r.text[:200]
+            return False,f"[{r.status_code}] {em}"
+        data=r.json()
+        txt="".join(b.get("text","") for b in data.get("content",[]) if isinstance(b,dict) and b.get("type")=="text")
+        return True,txt
+    except Exception as ex: return False,str(ex)
+
+def _call_gemini_api(model,msgs,key,max_tokens=4096,image_b64=None,image_mime=None,timeout=90):
+    """Call Google Gemini generateContent. Returns (ok, text_or_error)."""
+    sys_text,conv=_strip_system(msgs)
+    contents=[]
+    for m in conv:
+        role=m.get("role")
+        if role not in ("user","assistant"): continue
+        grole="model" if role=="assistant" else "user"
+        content=m.get("content"); parts=[]
+        if isinstance(content,str): parts.append({"text":content})
+        elif isinstance(content,list):
+            for c in content:
+                if isinstance(c,dict) and c.get("type")=="text": parts.append({"text":c.get("text","")})
+        else: parts.append({"text":str(content)})
+        if parts: contents.append({"role":grole,"parts":parts})
+    if image_b64 and contents:
+        for c in reversed(contents):
+            if c["role"]=="user":
+                c["parts"].append({"inline_data":{"mime_type":image_mime or "image/jpeg","data":image_b64}})
+                break
+    if not contents: contents=[{"role":"user","content":[{"text":"Hello"}]}]
+    body={"contents":contents,"generationConfig":{"maxOutputTokens":max_tokens}}
+    if sys_text: body["systemInstruction"]={"parts":[{"text":sys_text}]}
+    url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    try:
+        r=req.post(url,headers={"Content-Type":"application/json"},json=body,timeout=timeout)
+        if not r.ok:
+            try: em=r.json().get("error",{}).get("message",r.text[:200])
+            except: em=r.text[:200]
+            return False,f"[{r.status_code}] {em}"
+        data=r.json()
+        try: txt="".join(p.get("text","") for p in data["candidates"][0]["content"]["parts"])
+        except Exception: txt=""
+        return True,txt
+    except Exception as ex: return False,str(ex)
+
 @app.post("/api/register")
 async def register(request:Request):
     d=await request.json()
@@ -1198,48 +1303,29 @@ async def freeapi_query(request:Request):
     result=_call_free_api(api_key,query)
     return J({"ok":bool(result),"result":result or "","api":api_key})
 
-# ── DuckDuckGo Web Search (no API key needed) ─────────────────────────────────
-@app.post("/api/search/ddg")
-async def ddg_search(request:Request):
-    """DuckDuckGo search proxy — returns instant answer + organic results."""
-    import urllib.parse, re as _re
+# ── OpenSERP Bing Web Search (JSON, no API key needed) ────────────────────────
+@app.post("/api/search/web")
+async def web_search_proxy(request:Request):
+    """Bing search via OpenSERP — returns clean JSON results."""
+    import urllib.parse
     auth_user(request); d=await request.json()
     query=d.get("query","").strip()
     if not query: return J({"ok":False,"error":"query required","results":[]})
     try:
-        # 1. Try DuckDuckGo Instant Answer API first
-        ia_url=f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1"
-        ia=req.get(ia_url,headers={"User-Agent":"FusionAI/1.0"},timeout=8)
-        instant=""
-        results=[]
-        if ia.ok:
-            idata=ia.json()
-            abstract=idata.get("AbstractText","")
-            answer=idata.get("Answer","")
-            infobox=idata.get("Infobox",{})
-            if answer: instant=answer
-            elif abstract: instant=abstract
-            related=idata.get("RelatedTopics",[])
-            for t in related[:6]:
-                if isinstance(t,dict) and t.get("Text") and t.get("FirstURL"):
-                    results.append({"title":t.get("Text","")[:80],"url":t.get("FirstURL",""),"snippet":t.get("Text","")[:200]})
-        # 2. Scrape DDG HTML search for organic results
-        html_url=f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-        hr=req.get(html_url,headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36","Accept-Language":"en-US,en;q=0.9"},timeout=10)
-        if hr.ok:
-            html=hr.text
-            # Extract result titles and snippets
-            titles=_re.findall(r'class="result__a"[^>]*>([^<]+)</a>',html)
-            urls=_re.findall(r'class="result__url"[^>]*>([^<]+)</',html)
-            snips=_re.findall(r'class="result__snippet"[^>]*>(.*?)</a>',html,_re.DOTALL)
-            for i in range(min(len(titles),7)):
-                title=titles[i].strip() if i<len(titles) else ""
-                url=urls[i].strip() if i<len(urls) else ""
-                snippet=_re.sub(r"<[^>]+>","",snips[i]).strip() if i<len(snips) else ""
-                if title and url:
-                    results.append({"title":title,"url":url if url.startswith("http") else "https://"+url,"snippet":snippet[:300]})
-        return J({"ok":True,"query":query,"instant":instant,"results":results[:8]})
-    except Exception as e: return J({"ok":False,"error":str(e),"results":[]})
+        url=f"http://openserp.alwaysdata.net/bing/search?text={urllib.parse.quote(query)}"
+        r=req.get(url,headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},timeout=10)
+        if not r.ok:
+            return J({"ok":False,"error":f"Search API returned {r.status_code}","results":[]})
+        raw=r.json()  # list of {title, url, description}
+        results=[{"title":item.get("title",""),"url":item.get("url",""),"snippet":item.get("description","")} for item in (raw if isinstance(raw,list) else []) if item.get("url")]
+        return J({"ok":True,"query":query,"instant":"","results":results[:10]})
+    except Exception as e:
+        return J({"ok":False,"error":str(e),"results":[]})
+
+# Legacy alias — keeps old callers working
+@app.post("/api/search/ddg")
+async def ddg_search_alias(request:Request):
+    return await web_search_proxy(request)
 
 
 # ── Google OAuth ──────────────────────────────────────────────────────────────
@@ -1821,18 +1907,17 @@ async def deep_research(request:Request):
     else:
         sys_p=("You are a specialist AI researcher. Answer the following question concisely and accurately in 3-5 sentences from YOUR unique model perspective and training. Be direct. Do not repeat the question.")
 
-    # 1. Grab DDG web context (skip for math/code — not needed)
+    # 1. Grab Bing web context via OpenSERP (skip for math/code — not needed)
     web_ctx=""
     if mode=="general":
         try:
-            ia=req.get(f"https://api.duckduckgo.com/?q={_up2.quote(prompt)}&format=json&no_redirect=1&no_html=1&skip_disambig=1",timeout=5)
-            if ia.ok:
-                idata=ia.json(); ab=idata.get("AbstractText","") or idata.get("Answer","")
-                if ab: web_ctx=f"[Web Answer: {ab[:500]}]\n"
-            hr=req.get(f"https://html.duckduckgo.com/html/?q={_up2.quote(prompt)}",headers={"User-Agent":"Mozilla/5.0"},timeout=7)
-            if hr.ok:
-                snips=_re2.findall(r'class="result__snippet"[^>]*>(.*?)</a>',hr.text,_re2.DOTALL)
-                for s in snips[:5]: web_ctx+=_re2.sub(r"<[^>]+>","",s).strip()[:200]+"\n"
+            sr=req.get(f"http://openserp.alwaysdata.net/bing/search?text={_up2.quote(prompt)}",
+                       headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},timeout=8)
+            if sr.ok:
+                items=sr.json() if isinstance(sr.json(),list) else []
+                for item in items[:5]:
+                    snip=item.get("description","") or item.get("snippet","")
+                    if snip: web_ctx+=snip[:250]+"\n"
         except: pass
     if web_ctx: sys_p+=f"\n\nLive web context:\n{web_ctx[:800]}"
 
@@ -2000,27 +2085,31 @@ _HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
- --red:#e8293a;--red2:#b01e2c;--redg:rgba(232,41,58,.25);
- --blue:#1a6ef5;--blueg:rgba(26,110,245,.22);
- --grad:linear-gradient(135deg,var(--red),var(--blue));
- --gradt:linear-gradient(90deg,var(--red),var(--blue));
+ /* ── New FusionAI dark purple/cyan theme ── */
+ --red:#7c3aed;--red2:#6d28d9;--redg:rgba(124,58,237,.28);
+ --blue:#06b6d4;--blueg:rgba(6,182,212,.22);
+ --grad:linear-gradient(135deg,#7c3aed,#06b6d4);
+ --gradt:linear-gradient(90deg,#7c3aed,#06b6d4);
  --green:#22c55e;--purple:#a78bfa;
- --glass-bg:rgba(8,12,24,0.45);--glass-bg2:rgba(10,15,28,0.58);
- --glass-surf:rgba(15,22,40,0.52);--glass-surf2:rgba(20,30,52,0.58);
- --glass-bdr:rgba(60,100,180,0.18);--glass-bdr2:rgba(80,120,200,0.28);
- --blur:blur(22px) saturate(180%);--blur2:blur(14px) saturate(160%);
- --tx:#e8f0ff;--tx2:#7a95c0;--tx3:#3a5070;--shad:rgba(0,0,0,.7);--inp:rgba(8,12,24,0.6);
- --bg-body:#04060e;
+ --accent:#7c3aed;--accent2:#06b6d4;
+ --glass-bg:rgba(10,10,20,0.55);--glass-bg2:rgba(12,12,24,0.65);
+ --glass-surf:rgba(16,16,30,0.60);--glass-surf2:rgba(20,20,38,0.65);
+ --glass-bdr:rgba(124,58,237,0.15);--glass-bdr2:rgba(124,58,237,0.28);
+ --blur:blur(24px) saturate(180%);--blur2:blur(16px) saturate(160%);
+ --tx:#eeeeff;--tx2:#8888bb;--tx3:#44446a;--shad:rgba(0,0,0,.8);--inp:rgba(8,8,18,0.65);
+ --bg-body:#08080f;
+ --sidebar-w:242px;
+ --hdr-h:52px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%;overflow:hidden}
 body{font-family:'DM Sans',sans-serif;color:var(--tx);background:var(--bg-body);transition:background .3s,color .3s}
 .bg{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
 .bg-orb{position:absolute;border-radius:50%;filter:blur(80px);animation:orb 18s ease-in-out infinite alternate}
-.bg-orb1{width:700px;height:700px;top:-200px;left:-200px;background:radial-gradient(circle,rgba(232,41,58,.35),transparent 65%);animation-duration:16s}
-.bg-orb2{width:800px;height:800px;bottom:-250px;right:-250px;background:radial-gradient(circle,rgba(26,110,245,.3),transparent 65%);animation-duration:22s;animation-delay:-8s}
-.bg-orb3{width:500px;height:500px;top:40%;left:40%;background:radial-gradient(circle,rgba(120,40,200,.2),transparent 65%);animation-duration:28s;animation-delay:-4s}
-.bg-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(60,100,200,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(60,100,200,.05) 1px,transparent 1px);background-size:48px 48px;mask-image:radial-gradient(ellipse at center,black 40%,transparent 75%)}
+.bg-orb1{width:700px;height:700px;top:-200px;left:-200px;background:radial-gradient(circle,rgba(124,58,237,.3),transparent 65%);animation-duration:16s}
+.bg-orb2{width:800px;height:800px;bottom:-250px;right:-250px;background:radial-gradient(circle,rgba(6,182,212,.22),transparent 65%);animation-duration:22s;animation-delay:-8s}
+.bg-orb3{width:500px;height:500px;top:40%;left:40%;background:radial-gradient(circle,rgba(100,20,200,.18),transparent 65%);animation-duration:28s;animation-delay:-4s}
+.bg-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(124,58,237,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(124,58,237,.04) 1px,transparent 1px);background-size:48px 48px;mask-image:radial-gradient(ellipse at center,black 40%,transparent 75%)}
 /* Matrix canvas background */
 #matrixCanvas{position:fixed;inset:0;z-index:0;opacity:0;transition:opacity .5s;pointer-events:none}
 #matrixCanvas.active{opacity:.18}
@@ -4410,11 +4499,11 @@ async function _fbQuery(q){
   var status=document.getElementById('fbStatus');
   var secure=document.getElementById('fbSecure');
   if(welcome)welcome.style.display='none';
-  if(res){res.style.display='';res.innerHTML='<div style="padding:28px;text-align:center"><div class="thinking-dots" style="justify-content:center"><span></span><span></span><span></span></div><div style="font-size:11px;color:var(--tx3);margin-top:10px">Searching DuckDuckGo…</div></div>';}
+  if(res){res.style.display='';res.innerHTML='<div style="padding:28px;text-align:center"><div class="thinking-dots" style="justify-content:center"><span></span><span></span><span></span></div><div style="font-size:11px;color:var(--tx3);margin-top:10px">Searching Bing…</div></div>';}
   if(loadBar)loadBar.style.width='40%';
   if(status){status.style.display='';status.textContent='Connecting…';}
   try{
-    var r=await apiFetch('/api/search/ddg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
+    var r=await apiFetch('/api/search/web',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
     var d=await r.json();
     if(loadBar){loadBar.style.width='100%';setTimeout(function(){loadBar.style.width='0%';},350);}
     if(status){status.textContent=(d.results&&d.results.length?d.results.length+' results':'No results');setTimeout(function(){if(status)status.style.display='none';},2000);}
@@ -4515,27 +4604,27 @@ function updateTokenCount(val){
   window.addEventListener('resize',function(){W=c.width=window.innerWidth;H=c.height=window.innerHeight;});
 })();
 
-// ── DuckDuckGo AI Browser ─────────────────────────────────────────────────────
-var _ddgResults=[], _ddgQuery='', _ddgInstant='';
-async function doDDGSearch(){
+// ── Bing AI Search Browser (via OpenSERP) ────────────────────────────────────
+var _bingResults=[], _bingQuery='';
+async function doBingSearch(){
   var q=(document.getElementById('ddgQuery')||{}).value||''; q=q.trim();
   if(!q){showToast('Enter a search query');return;}
   var st=document.getElementById('ddgStatus');var res=document.getElementById('ddgResults');
   var instant=document.getElementById('ddgInstant');var sendBtn=document.getElementById('ddgSendBtn');
-  st.style.display='';st.textContent='🦆 Searching DuckDuckGo…';
+  st.style.display='';st.textContent='🔍 Searching Bing…';
   res.innerHTML='';instant.style.display='none';sendBtn.style.display='none';
   try{
-    var r=await apiFetch('/api/search/ddg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
+    var r=await apiFetch('/api/search/web',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
     var d=await r.json();
     st.textContent='';st.style.display='none';
-    _ddgQuery=q; _ddgInstant=d.instant||''; _ddgResults=d.results||[];
+    _bingQuery=q; _bingResults=d.results||[];
     if(d.instant){
       instant.style.display='';
-      instant.innerHTML='<div style="font-size:10px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">⚡ Instant Answer</div>'
+      instant.innerHTML='<div style="font-size:10px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">⚡ Top Result</div>'
         +'<div style="font-size:13px;color:var(--tx);line-height:1.7">'+escHtml(d.instant)+'</div>';
     }
-    if(_ddgResults.length){
-      _ddgResults.forEach(function(r2,i){
+    if(_bingResults.length){
+      _bingResults.forEach(function(r2){
         var card=document.createElement('div');card.className='ddg-result';
         card.innerHTML='<div class="ddg-result-title">'+escHtml(r2.title||'')+'</div>'
           +'<div class="ddg-result-url">'+escHtml((r2.url||'').replace(/https?:\/\//,'').substring(0,60))+'</div>'
@@ -4549,30 +4638,29 @@ async function doDDGSearch(){
     }
   }catch(e){st.textContent='Search failed: '+e.message;}
 }
+// keep old function name working
+function doDDGSearch(){return doBingSearch();}
 
 async function sendDDGToChat(){
-  if(!_ddgQuery&&!_ddgResults.length){showToast('Search first');return;}
+  if(!_bingQuery&&!_bingResults.length){showToast('Search first');return;}
   closeSP();
-  var ctx='Web search results for: "'+_ddgQuery+'"\n\n';
-  if(_ddgInstant)ctx+='Instant Answer: '+_ddgInstant+'\n\n';
-  _ddgResults.forEach(function(r,i){ctx+=(i+1)+'. '+r.title+'\n   '+r.url+'\n   '+r.snippet+'\n\n';});
-  var prompt='Based on these DuckDuckGo search results, give me a clear, well-structured answer about "'+_ddgQuery+'".\n\nSearch Results:\n'+ctx+'\nSummarise the key information in a helpful way. Use your knowledge to add context where useful.';
+  var ctx='Bing search results for: "'+_bingQuery+'"\n\n';
+  _bingResults.forEach(function(r,i){ctx+=(i+1)+'. '+r.title+'\n   '+r.url+'\n   '+r.snippet+'\n\n';});
+  var prompt='Based on these Bing search results, give me a clear, well-structured answer about "'+_bingQuery+'".\n\nSearch Results:\n'+ctx+'\nSummarise the key information in a helpful way. Use your knowledge to add context where useful.';
   document.getElementById('msgIn').value=prompt;
   sendMsg();
 }
 
-// ── Auto web search: ALWAYS fires for every chat message ─────────────────────
+// ── Auto web search — always on ──────────────────────────────────────────────
 async function _autoWebSearch(text){
   if(!text||text.startsWith('/')||text.length<4) return null;
   try{
-    var r=await apiFetch('/api/search/ddg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:text.slice(0,200)})});
+    var r=await apiFetch('/api/search/web',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:text.slice(0,200)})});
     var d=await r.json();
     if(!d.ok) return null;
     var ctx='';
     if(d.instant) ctx+='[Web: '+d.instant+']\n';
-    (d.results||[]).slice(0,5).forEach(function(res){
-      if(res.snippet) ctx+='['+res.title+': '+res.snippet+']\n';
-    });
+    (d.results||[]).slice(0,5).forEach(function(res){if(res.snippet) ctx+='['+res.title+': '+res.snippet+']\n';});
     return ctx.trim()||null;
   }catch(e){return null;}
 }
@@ -8279,13 +8367,48 @@ async function _fosEdRun(id){
 
 // ── Browser ───────────────────────────────────────────────────────────────────
 function _fosBrowser(body,id,startUrl){
-  var url=startUrl||'https://www.google.com';
-  body.innerHTML='<div class="fos-browser"><div class="fos-bbar"><button onclick="_fosBNav(\''+id+'\',\'back\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:26px;height:24px;color:#fff;cursor:pointer">←</button><button onclick="_fosBNav(\''+id+'\',\'fwd\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:26px;height:24px;color:#fff;cursor:pointer">→</button><button onclick="_fosBRld(\''+id+'\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:26px;height:24px;color:#fff;cursor:pointer">↻</button><input id="'+id+'-url" value="'+escHtml(url)+'" style="flex:1;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.09);border-radius:7px;padding:5px 10px;color:#c8ddf0;font-size:11.5px;outline:none" onkeydown="if(event.key===\'Enter\')_fosBGo(\''+id+'\')"/><button onclick="_fosBGo(\''+id+'\')" style="background:rgba(74,158,255,.16);border:1px solid rgba(74,158,255,.3);border-radius:7px;padding:5px 10px;color:#7ec3ff;font-size:11px;font-weight:600;cursor:pointer">Go</button></div><div class="fos-bfavs"><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://www.google.com\')">Google</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://github.com\')">GitHub</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://stackoverflow.com\')">StackOverflow</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://developer.mozilla.org\')">MDN</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://pypi.org\')">PyPI</button><button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://npmjs.com\')">npm</button></div><iframe id="'+id+'-fr" class="fos-frame" src="'+escHtml(url)+'" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-navigation"></iframe></div>';
+  body.innerHTML='<div class="fos-browser">'
+    +'<div class="fos-bbar">'
+      +'<button onclick="_fosBNav(\''+id+'\',\'back\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:28px;height:26px;color:#fff;cursor:pointer;font-size:14px">←</button>'
+      +'<button onclick="_fosBNav(\''+id+'\',\'fwd\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:28px;height:26px;color:#fff;cursor:pointer;font-size:14px">→</button>'
+      +'<button onclick="_fosBRld(\''+id+'\')" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;width:28px;height:26px;color:#fff;cursor:pointer">↻</button>'
+      +'<input id="'+id+'-url" placeholder="Enter URL or search…" style="flex:1;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.09);border-radius:7px;padding:5px 10px;color:#c8ddf0;font-size:11.5px;outline:none" onkeydown="if(event.key===\'Enter\')_fosBGo(\''+id+'\')"/>'
+      +'<button onclick="_fosBGo(\''+id+'\')" style="background:rgba(74,158,255,.16);border:1px solid rgba(74,158,255,.3);border-radius:7px;padding:5px 11px;color:#7ec3ff;font-size:11px;font-weight:600;cursor:pointer">Go</button>'
+    +'</div>'
+    +'<div class="fos-bfavs">'
+      +'<button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://www.google.com\')">Google</button>'
+      +'<button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://github.com\')">GitHub</button>'
+      +'<button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://wikipedia.org\')">Wikipedia</button>'
+      +'<button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://developer.mozilla.org\')">MDN</button>'
+      +'<button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://pypi.org\')">PyPI</button>'
+      +'<button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://npmjs.com\')">npm</button>'
+      +'<button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://news.ycombinator.com\')">HN</button>'
+    +'</div>'
+    +'<div id="'+id+'-info" style="display:none;padding:6px 10px;font-size:10px;color:rgba(255,255,255,.35);border-bottom:1px solid rgba(255,255,255,.04);flex-shrink:0">Loading via proxy…</div>'
+    +'<iframe id="'+id+'-fr" class="fos-frame" src="about:blank" referrerpolicy="no-referrer"></iframe>'
+  +'</div>';
+  if(startUrl) _fosBLoad(id, startUrl);
 }
-function _fosBGo(id){ var u=document.getElementById(id+'-url').value.trim(); if(u&&!u.startsWith('http'))u='https://'+u; _fosBLoad(id,u); }
-function _fosBLoad(id,url){ var fr=document.getElementById(id+'-fr'); var ur=document.getElementById(id+'-url'); if(fr)fr.src=url; if(ur)ur.value=url; }
+function _fosBGo(id){
+  var u=(document.getElementById(id+'-url')||{}).value||''; u=u.trim();
+  if(!u) return;
+  if(!u.startsWith('http') && !u.includes(' ') && u.includes('.')) u='https://'+u;
+  else if(!u.startsWith('http')) u='https://www.google.com/search?q='+encodeURIComponent(u);
+  _fosBLoad(id,u);
+}
+function _fosBLoad(id,url){
+  var ur=document.getElementById(id+'-url'); if(ur) ur.value=url;
+  var fr=document.getElementById(id+'-fr'); if(!fr) return;
+  var info=document.getElementById(id+'-info');
+  if(info){ info.style.display='block'; info.textContent='🔄 Loading '+url+'…'; }
+  // Route through server-side proxy to bypass X-Frame-Options
+  var proxyUrl='/api/fos/proxy?url='+encodeURIComponent(url)+'&_auth='+encodeURIComponent(localStorage.getItem('token')||'');
+  fr.src=proxyUrl;
+  fr.onload=function(){ if(info) info.style.display='none'; };
+  fr.onerror=function(){ if(info){ info.style.display='block'; info.textContent='Failed — try opening in a new tab'; info.innerHTML=info.textContent+' <a href="'+url+'" target="_blank" style="color:#4a9eff">↗</a>'; } };
+}
+function _fosBRld(id){ var fr=document.getElementById(id+'-fr'); if(fr) fr.src=fr.src; }
 function _fosBNav(id,dir){ var fr=document.getElementById(id+'-fr'); if(fr){try{dir==='back'?fr.contentWindow.history.back():fr.contentWindow.history.forward();}catch(e){}} }
-function _fosBRld(id){ var fr=document.getElementById(id+'-fr'); if(fr)fr.src=fr.src; }
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
 function _fosAgent(body,id){
@@ -8596,19 +8719,15 @@ async def api_extreme_think(request: Request):
     steps=[]; web_ctx_parts=[]
 
     # ── Phase 1: 12 web searches (varied angles) ─────────────────────────
-    def _ddg_search(q):
+    def _bing_search(q):
         try:
             import urllib.parse as _up4
-            r=req.get(f"https://api.duckduckgo.com/?q={_up4.quote(q)}&format=json&no_redirect=1&no_html=1",timeout=6)
+            r=req.get(f"http://openserp.alwaysdata.net/bing/search?text={_up4.quote(q)}",
+                      headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},timeout=8)
             if r.ok:
-                dj=r.json(); ab=dj.get("AbstractText","") or dj.get("Answer","") or dj.get("Definition","")
-                if ab: return f"[{q}]: {ab[:400]}"
-            # Fallback: HTML snippets
-            hr=req.get(f"https://html.duckduckgo.com/html/?q={_up4.quote(q)}",headers={"User-Agent":"Mozilla/5.0"},timeout=7)
-            if hr.ok:
-                snips=_re4.findall(r'class="result__snippet"[^>]*>(.*?)</a>',hr.text,_re4.DOTALL)
-                txt=" | ".join(_re4.sub(r"<[^>]+>","",s).strip()[:180] for s in snips[:4])
-                if txt: return f"[{q}]: {txt}"
+                items=r.json() if isinstance(r.json(),list) else []
+                snippets=" | ".join((item.get("description","") or item.get("snippet",""))[:180] for item in items[:4] if item.get("description") or item.get("snippet"))
+                if snippets: return f"[{q}]: {snippets}"
         except: pass
         return ""
 
@@ -8628,7 +8747,7 @@ async def api_extreme_think(request: Request):
     ]
     steps.append({"phase":"search","status":"Performing 12 web searches…"})
     with ThreadPoolExecutor(max_workers=12) as ex:
-        sr=[ex.submit(_ddg_search,q) for q in search_angles]
+        sr=[ex.submit(_bing_search,q) for q in search_angles]
         raw_searches=[f.result() for f in as_completed(sr,timeout=18)]
     web_ctx="\n".join(r for r in raw_searches if r)
     steps.append({"phase":"search","status":f"Web search complete: {len([r for r in raw_searches if r])}/12 returned data","ctx_chars":len(web_ctx)})
@@ -9396,6 +9515,40 @@ Use viewBox="0 0 {w} {h}" width="{w}" height="{h}". Create rich {style} art with
     svg=m.group(1) if m else raw
     if 'viewBox' not in svg: svg=svg.replace('<svg',f'<svg viewBox="0 0 {w} {h}"',1)
     return J({"svg":svg})
+
+
+# ── FusionOS browser proxy — strips X-Frame-Options so pages load in iframe ──
+@app.get("/api/fos/proxy")
+async def api_fos_proxy(request: Request, url: str = ""):
+    auth_user(request)
+    if not url: return HTMLResponse("<p>No URL provided</p>", status_code=400)
+    if not url.startswith("http"): url = "https://" + url
+    from urllib.parse import urlparse; import re as _rfp
+    host = urlparse(url).hostname or ""
+    if any(b in host for b in ["localhost","127.","0.0.0.0","169.254","::1"]):
+        return HTMLResponse("<p>Blocked</p>", status_code=403)
+    try:
+        r = req.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
+            "Accept": "text/html,application/xhtml+xml,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        }, timeout=12, allow_redirects=True)
+        ct = r.headers.get("Content-Type","text/html")
+        if "text/html" not in ct:
+            return HTMLResponse(f"<p style='font-family:sans-serif;padding:20px'>Cannot display non-HTML content ({ct}).<br><br><a href='{url}' target='_blank'>Open in new tab ↗</a></p>")
+        html = r.text
+        base = f'<base href="{url}" target="_blank">'
+        html = _rfp.sub(r'(?i)<head>', '<head>' + base, html, count=1)
+        if '<base' not in html: html = base + html
+        # Strip frame-buster scripts
+        html = _rfp.sub(r'(?is)<script[^>]*>.*?</script>', '', html)
+        return HTMLResponse(html, headers={
+            "Content-Type": "text/html; charset=utf-8",
+            "X-Frame-Options": "ALLOWALL",
+            "Content-Security-Policy": "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:",
+        })
+    except Exception as ex:
+        return HTMLResponse(f"<div style='font-family:sans-serif;padding:24px;color:#e88;background:#0a0c14'><b>Failed to load:</b><br>{url}<br><br>{ex}<br><br><a href='{url}' target='_blank' style='color:#4a9eff'>Open in new tab ↗</a></div>")
 
 
 @app.get("/")
