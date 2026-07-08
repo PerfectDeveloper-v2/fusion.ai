@@ -3211,15 +3211,15 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
 <div class="conv-sidebar-overlay" id="convSbOverlay" onclick="closeConvSidebar()"></div>
 <div class="conv-sidebar" id="convSidebar">
   <div class="conv-sb-head">
-    <span class="conv-sb-logo">⚡</span>
+    <span class="conv-sb-logo"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M11 2L4 12h5l-1 6 7-10h-5z"/></svg></span>
     <span class="conv-sb-title">Fusion.AI</span>
     <button class="conv-sb-close" onclick="closeConvSidebar()">&#x2715;</button>
   </div>
   <div class="conv-sb-new" onclick="if(window.innerWidth<=768)closeConvSidebar();newConv()">
-    <span style="font-size:16px">✏️</span> New Chat
+    <svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4v12M4 10h12"/></svg> New Chat
   </div>
   <div class="conv-sb-search">
-    <span class="conv-sb-search-icon">🔍</span>
+    <span class="conv-sb-search-icon"><svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8.5" cy="8.5" r="5.5"/><path d="M17 17l-4-4"/></svg></span>
     <input type="text" placeholder="Search conversations…" id="convSbSearch" oninput="filterConvs(this.value)">
   </div>
   <div class="conv-sb-list" id="convSbList">
@@ -3341,7 +3341,7 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
   <header>
     <div class="hl" style="gap:8px;display:flex;align-items:center">
       <button class="sidebar-toggle" onclick="toggleConvSidebar()" title="Conversations">&#x2630;</button>
-      <div class="hlm">&#x26A1;</div><span class="htxt">Fusion.AI</span>
+      <div class="hlm"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M11 2L4 12h5l-1 6 7-10h-5z"/></svg></div><span class="htxt">Fusion.AI</span>
     </div>
     <div class="hr">
       <div class="mpill"><div class="ldot"></div><span id="mlabel">Auto</span></div>
@@ -3415,14 +3415,14 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
     </div>
     <!-- Quick Action Chips -->
     <div class="qa-bar" id="qaBar">
-      <div class="qa-chip" onclick="openToolsHub()">🛠 Tools Hub</div>
-      <div class="qa-chip" onclick="sendQuickMsg('Summarise this for me')">📋 Summarise</div>
-      <div class="qa-chip" onclick="sendQuickMsg('Translate this to English')">🌍 Translate</div>
-      <div class="qa-chip" onclick="sendQuickMsg('Rewrite this more professionally')">✍️ Rewrite</div>
-      <div class="qa-chip" onclick="sendQuickMsg('Debug this code and explain the issues')">🐛 Debug</div>
-      <div class="qa-chip" onclick="sendQuickMsg('Explain this step by step')">🧪 Explain</div>
-      <div class="qa-chip" onclick="openFileCreator()">📁 Create File</div>
-      <div class="qa-chip" onclick="openArena()">🏆 Arena</div>
+      <div class="qa-chip" onclick="openToolsHub()"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M12 4l4 4-7 7-4-4z"/><path d="M13 3l4 4"/><circle cx="6" cy="14" r="2"/></svg>Tools</div>
+      <div class="qa-chip" onclick="sendQuickMsg('Summarise this for me')"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M3 6a1 1 0 0 1 1-1h4l2 2h6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6z"/></svg>Summarise</div>
+      <div class="qa-chip" onclick="sendQuickMsg('Translate this to English')"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><circle cx="10" cy="10" r="7"/><path d="M3 10h14M10 3a11 11 0 0 1 0 14 11 11 0 0 1 0-14z"/></svg>Translate</div>
+      <div class="qa-chip" onclick="sendQuickMsg('Rewrite this more professionally')"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M4 16l1-4 9-9 3 3-9 9-4 1z"/></svg>Rewrite</div>
+      <div class="qa-chip" onclick="sendQuickMsg('Debug this code and explain the issues')"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><circle cx="10" cy="11" r="5"/><path d="M8 6l-1-2M12 6l1-2M5 10H3M17 10h-2M6 15l-2 2M14 15l2 2"/></svg>Debug</div>
+      <div class="qa-chip" onclick="sendQuickMsg('Explain this step by step')"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M8 3h4M8 3v5l-4 8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1l-4-8V3"/></svg>Explain</div>
+      <div class="qa-chip" onclick="openFileCreator()"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M3 6a1 1 0 0 1 1-1h4l2 2h6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6z"/></svg>Create File</div>
+      <div class="qa-chip" onclick="openArena()"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M6 4h8v4a4 4 0 0 1-8 0V4z"/><path d="M4 5H2v1a3 3 0 0 0 3 3M16 5h2v1a3 3 0 0 1-3 3M8 13v2h4v-2M6 17h8"/></svg>Arena</div>
     </div>
     <!-- Tool bar — below chatbox, icons expand inline panels -->
     <div class="tbar" id="tbar">
@@ -6051,6 +6051,36 @@ function userErrorToast(techMsg, friendlyMsg, dur) {
   showToast(msg, dur||5000);
 }
 function ar(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,140)+'px';}
+
+// ── SVG icon set (replaces emoji in core chrome — line-style, currentColor) ──
+var ICONS={
+  plus:'<path d="M10 4v12M4 10h12"/>',
+  search:'<circle cx="8.5" cy="8.5" r="5.5"/><path d="M17 17l-4-4"/>',
+  chat:'<path d="M3 10a7 7 0 0 1 7-7h0a7 7 0 0 1 7 7v0a7 7 0 0 1-7 7H6l-3 2v-9z"/>',
+  trash:'<path d="M4 6h12M8 6V4h4v2M6 6l1 11h6l1-11"/>',
+  send:'<path d="M3 10l14-7-5 14-2.5-5.5L3 10z"/>',
+  mic:'<rect x="8" y="2" width="4" height="9" rx="2"/><path d="M5 9a5 5 0 0 0 10 0M10 14v3M7 17h6"/>',
+  clip:'<path d="M8 5v9a3 3 0 0 0 6 0V4a2 2 0 0 0-4 0v9a1 1 0 0 0 2 0V6"/>',
+  menu:'<path d="M3 5h14M3 10h14M3 15h14"/>',
+  tools:'<path d="M12 4l4 4-7 7-4-4z"/><path d="M13 3l4 4"/><circle cx="6" cy="14" r="2"/>',
+  globe:'<circle cx="10" cy="10" r="7"/><path d="M3 10h14M10 3a11 11 0 0 1 0 14 11 11 0 0 1 0-14z"/>',
+  pen:'<path d="M4 16l1-4 9-9 3 3-9 9-4 1z"/>',
+  bug:'<circle cx="10" cy="11" r="5"/><path d="M8 6l-1-2M12 6l1-2M5 10H3M17 10h-2M6 15l-2 2M14 15l2 2"/>',
+  flask:'<path d="M8 3h4M8 3v5l-4 8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1l-4-8V3"/>',
+  folder:'<path d="M3 6a1 1 0 0 1 1-1h4l2 2h6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6z"/>',
+  trophy:'<path d="M6 4h8v4a4 4 0 0 1-8 0V4z"/><path d="M4 5H2v1a3 3 0 0 0 3 3M16 5h2v1a3 3 0 0 1-3 3M8 13v2h4v-2M6 17h8"/>',
+  chip:'<rect x="6" y="6" width="8" height="8" rx="1"/><path d="M8 3v2M12 3v2M8 15v2M12 15v2M3 8h2M3 12h2M15 8h2M15 12h2"/>',
+  brain:'<path d="M8 4a3 3 0 0 0-3 3v1a3 3 0 0 0-1 5.5A3 3 0 0 0 7 17a3 3 0 0 0 3-2M12 4a3 3 0 0 1 3 3v1a3 3 0 0 1 1 5.5A3 3 0 0 1 13 17a3 3 0 0 1-3-2M10 4v13"/>',
+  check:'<path d="M4 10l4 4 8-8"/>',
+  hash:'<path d="M7 3l-1.5 14M14 3l-1.5 14M3 7h14M3 13h14"/>',
+  mail:'<rect x="2" y="4" width="16" height="12" rx="1"/><path d="M2 5l8 6 8-6"/>',
+  code:'<path d="M7 5L2 10l5 5M13 5l5 5-5 5"/>',
+};
+function _ic(name,size){
+  size=size||16;
+  var body=ICONS[name]||ICONS.chat;
+  return '<svg width="'+size+'" height="'+size+'" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px">'+body+'</svg>';
+}
 function handleKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}}
 function suggest(t){document.getElementById('msgIn').value=t;sendMsg();}
 function scrollDown(){document.getElementById('chatBody').scrollTop=document.getElementById('chatBody').scrollHeight;}
@@ -6554,7 +6584,7 @@ function _makeCodeWinDraggable(){
   document.onmouseup=function(){ dragging=false; };
 }
 
-var WELCOME_HTML='<div class="welcome" id="ws"><div class="wico">&#x26A1;</div><h1>Fusion.AI</h1>'
+var WELCOME_HTML='<div class="welcome" id="ws"><div class="wico"><svg width="34" height="34" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 2L4 12h5l-1 6 7-10h-5z"/></svg></div><h1>Fusion.AI</h1>'
   +'<p>Your intelligent AI — chat, create documents, build datasets, generate images, video, 3D and more.</p>'
   +'<div id="welcomeWx" style="display:none;font-size:12px;color:var(--tx3);margin-bottom:4px"></div>'
   +'<div class="wsubt">Your AI Powerhouse</div>'
@@ -7897,20 +7927,22 @@ async function _setAvatar(emoji){
 
 // ══ AI Tools Hub ════════════════════════════════════════════════════════════
 var _TOOLS=[
-  {id:'translate',icon:'🌍',name:'Translator',desc:'Detect & translate any language instantly'},
-  {id:'summarise',icon:'📋',name:'Summariser',desc:'Condense text into key points or TL;DR'},
-  {id:'rewrite',  icon:'✍️',name:'Rewriter',  desc:'Change tone: formal, casual, concise'},
-  {id:'quiz',     icon:'🧠',name:'Quiz Maker', desc:'Generate interactive quizzes on any topic'},
-  {id:'grammar',  icon:'✅',name:'Grammar Fix', desc:'Fix spelling, grammar and punctuation'},
-  {id:'hashtags', icon:'#️⃣',name:'Hashtags',   desc:'Generate hashtags for social media posts'},
-  {id:'email',    icon:'📧',name:'Email Draft', desc:'Write professional emails from bullet points'},
-  {id:'code_explain',icon:'💻',name:'Code Explainer',desc:'Paste code, get plain English explanation'},
+  {id:'translate',icon:'globe',name:'Translator',desc:'Detect & translate any language instantly'},
+  {id:'summarise',icon:'folder',name:'Summariser',desc:'Condense text into key points or TL;DR'},
+  {id:'rewrite',  icon:'pen',name:'Rewriter',  desc:'Change tone: formal, casual, concise'},
+  {id:'quiz',     icon:'brain',name:'Quiz Maker', desc:'Generate interactive quizzes on any topic'},
+  {id:'grammar',  icon:'check',name:'Grammar Fix', desc:'Fix spelling, grammar and punctuation'},
+  {id:'hashtags', icon:'hash',name:'Hashtags',   desc:'Generate hashtags for social media posts'},
+  {id:'email',    icon:'mail',name:'Email Draft', desc:'Write professional emails from bullet points'},
+  {id:'code_explain',icon:'code',name:'Code Explainer',desc:'Paste code, get plain English explanation'},
+  {id:'websearch',icon:'search',name:'Web Search', desc:'Search the live web, bring results into chat'},
+  {id:'webscrape',icon:'chip',name:'Web Scraper', desc:'Pull clean text & links from any page'},
 ];
 var _activeToolId=null;
 
 function openToolsHub(){
   document.getElementById('toolsHubOverlay').classList.remove('hidden');
-  document.getElementById('toolsHubTitle').textContent='🛠 AI Tools';
+  document.getElementById('toolsHubTitle').innerHTML=_ic('tools',18)+' AI Tools';
   _showToolGrid();
 }
 function closeToolsHub(){document.getElementById('toolsHubOverlay').classList.add('hidden');_activeToolId=null;}
@@ -7918,12 +7950,12 @@ function toolsHubClickOut(e){if(e.target.id==='toolsHubOverlay')closeToolsHub();
 
 function _showToolGrid(){
   _activeToolId=null;
-  document.getElementById('toolsHubTitle').textContent='🛠 AI Tools';
+  document.getElementById('toolsHubTitle').innerHTML=_ic('tools',18)+' AI Tools';
   var body=document.getElementById('toolsHubBody');
   body.innerHTML='<div class="tools-hub-grid">'
     +_TOOLS.map(function(t){
       return '<div class="tool-card" onclick="openTool(\''+t.id+'\')">'
-        +'<div class="tool-card-icon">'+t.icon+'</div>'
+        +'<div class="tool-card-icon">'+_ic(t.icon,26)+'</div>'
         +'<div class="tool-card-name">'+t.name+'</div>'
         +'<div class="tool-card-desc">'+t.desc+'</div>'
         +'</div>';
@@ -7934,9 +7966,46 @@ function openTool(id){
   _activeToolId=id;
   var t=_TOOLS.find(function(x){return x.id===id;});
   if(!t) return;
-  document.getElementById('toolsHubTitle').textContent=t.icon+' '+t.name;
+  document.getElementById('toolsHubTitle').innerHTML=_ic(t.icon,18)+' '+t.name;
   var body=document.getElementById('toolsHubBody');
   var backBtn='<div class="tool-panel-back" onclick="_showToolGrid()">← All Tools</div>';
+  if(id==='websearch'){
+    body.innerHTML=backBtn+
+      '<div class="tool-panel active">'+
+      '<div style="display:flex;gap:8px;margin-bottom:10px">'+
+      '<input class="tool-textarea" id="ddgQuery" placeholder="Search the web…" style="height:auto;padding:10px 12px" onkeydown="if(event.key===\'Enter\')doBingSearch()"/>'+
+      '<button class="tool-run-btn" onclick="doBingSearch()" style="width:auto;padding:0 18px;flex-shrink:0">'+_ic('search',15)+' Search</button>'+
+      '</div>'+
+      '<div id="ddgStatus" style="display:none;font-size:12px;color:var(--tx3);padding:8px 0"></div>'+
+      '<div id="ddgInstant" style="display:none;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:12px;margin-bottom:10px"></div>'+
+      '<div id="ddgResults" style="display:flex;flex-direction:column;gap:8px;max-height:320px;overflow-y:auto"></div>'+
+      '<button id="ddgSendBtn" class="tool-run-btn" style="display:none;margin-top:10px" onclick="sendDDGToChat()">'+_ic('send',14)+' Send results to chat</button>'+
+      '</div>';
+    return;
+  }
+  if(id==='webscrape'){
+    body.innerHTML=backBtn+
+      '<div class="tool-panel active">'+
+      '<div style="display:flex;gap:8px;margin-bottom:10px">'+
+      '<input class="tool-textarea" id="scraperUrl" placeholder="https://example.com" style="height:auto;padding:10px 12px" onkeydown="if(event.key===\'Enter\')doScrape()"/>'+
+      '<button class="tool-run-btn" onclick="doScrape()" style="width:auto;padding:0 18px;flex-shrink:0">'+_ic('chip',15)+' Scrape</button>'+
+      '</div>'+
+      '<div id="scraperStatus" style="display:none;font-size:12px;color:var(--tx3);padding:8px 0"></div>'+
+      '<div id="scraperResult" style="display:none">'+
+        '<div id="scraperTitle" style="font-size:14px;font-weight:700;color:var(--tx);margin-bottom:2px"></div>'+
+        '<div id="scraperDesc" style="font-size:11px;color:var(--tx3);margin-bottom:6px"></div>'+
+        '<div id="scraperMeta" style="font-size:10px;color:var(--tx3);font-family:monospace;margin-bottom:10px"></div>'+
+        '<textarea id="scraperText" class="tool-textarea" rows="8" readonly></textarea>'+
+        '<div id="scraperLinksWrap" style="display:none;margin-top:10px">'+
+          '<div style="font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px">'+
+          '<span id="scraperLinkCount">0</span> links found</div>'+
+          '<div id="scraperLinks" style="max-height:120px;overflow-y:auto;font-size:11px;color:var(--accent2);display:flex;flex-direction:column;gap:3px"></div>'+
+        '</div>'+
+        '<button class="tool-run-btn" style="margin-top:10px" onclick="sendScrapedToChat()">'+_ic('send',14)+' Send to chat</button>'+
+      '</div>'+
+      '</div>';
+    return;
+  }
 
   if(id==='translate'){
     body.innerHTML=backBtn+
