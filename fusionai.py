@@ -60,6 +60,7 @@ def _get_data_dir():
             except: continue
     return "."
 _data_dir = _get_data_dir()
+_PERSISTENT_DISK = os.path.isdir("/data")  # True only if a real mounted disk exists (e.g. Render paid disk)
 DB             = os.path.join(_data_dir,"fusionai.db")
 
 def cf_ep(model,acc=None): return f"https://api.cloudflare.com/client/v4/accounts/{acc or CF_ACCOUNT_ID}/ai/run/{model}"
@@ -670,6 +671,50 @@ async def chat(request:Request):
     full_msg=user_msg
     if file_text: full_msg=(user_msg+"\n\n[File]:\n"+file_text[:80000]).strip() or "[File]:\n"+file_text[:80000]
     if not full_msg: full_msg="Analyse this image."
+
+    # ── Custom user-supplied API endpoint — fully separate path ──────────────
+    # Bypasses MODELS/avail entirely since this is per-request, user-owned infra,
+    # not something we should inject into the shared global MODELS dict.
+    custom_ep=d.get("custom_endpoint")
+    if mkey=="custom_ep" and isinstance(custom_ep,dict) and custom_ep.get("url","").strip():
+        cep_url=custom_ep["url"].strip()
+        cep_model=(custom_ep.get("model") or "default").strip()
+        cep_key=(custom_ep.get("key") or "").strip()
+        cep_msgs=[{"role":"system","content":f"You are Fusion.AI. Today is {datetime.now().strftime('%A, %B %d, %Y')}."}]+history+[{"role":"user","content":full_msg}]
+        def gen_custom():
+            hdrs={"Content-Type":"application/json"}
+            if cep_key: hdrs["Authorization"]=f"Bearer {cep_key}"
+            body={"model":cep_model,"messages":cep_msgs,"max_tokens":4096,"stream":True}
+            try:
+                r=req.post(cep_url,headers=hdrs,json=body,stream=True,timeout=90)
+            except Exception as ex:
+                yield f"data: {json.dumps({'type':'error','message':f'Could not reach your endpoint: {ex}'})}\n\n"; return
+            if not r.ok:
+                try: em=r.json().get("error",{}); em=em.get("message",str(em)) if isinstance(em,dict) else str(em)
+                except: em=r.text[:300]
+                yield f"data: {json.dumps({'type':'error','message':f'Your endpoint returned [{r.status_code}]: {em}'})}\n\n"; return
+            yield f"data: {json.dumps({'type':'meta','model':cep_model+' (custom)','reason':'Custom endpoint'})}\n\n"
+            full_txt=""
+            try:
+                for line in r.iter_lines():
+                    if not line: continue
+                    if isinstance(line,bytes): line=line.decode("utf-8","replace")
+                    if not line.startswith("data: ") or line=="data: [DONE]": continue
+                    try:
+                        parsed=json.loads(line[6:])
+                        delta=parsed.get("choices",[{}])[0].get("delta",{})
+                        piece=delta.get("content","")
+                        if piece: full_txt+=piece; yield f"data: {json.dumps({'type':'delta','text':piece})}\n\n"
+                    except Exception: continue
+            except Exception as ex:
+                yield f"data: {json.dumps({'type':'error','message':f'Stream error: {ex}'})}\n\n"; return
+            if not full_txt.strip():
+                yield f"data: {json.dumps({'type':'error','message':'Your endpoint responded but returned no content — check the model name matches what your server expects.'})}\n\n"; return
+            with db() as c2: c2.execute("INSERT INTO messages(user_id,role,content,model,ts)VALUES(?,?,?,?,?)",(u["id"],"assistant",full_txt,cep_model+" (custom)",_now()))
+            yield f"data: {json.dumps({'type':'done'})}\n\n"
+        with db() as c: c.execute("INSERT INTO messages(user_id,role,content,model,ts)VALUES(?,?,?,?,?)",(u["id"],"user",user_msg,cep_model+" (custom)",_now()))
+        return StreamingResponse(gen_custom(),media_type="text/event-stream")
+
     avail=get_available(u["id"],u["salt"])
     has_img=bool(image_b64)
     if mkey and mkey in MODELS and MODELS[mkey]["provider"] in avail and MODELS[mkey].get("type","chat")=="chat": pick={"key":mkey,"reason":"Manual"}
@@ -1084,7 +1129,7 @@ async def detect_intent(request:Request):
 # ── Mega Free API Router ──────────────────────────────────────────────────────
 _FREE_APIS = {
   "wiki":     lambda q: f"https://en.wikipedia.org/api/rest_v1/page/summary/{q.replace(' ','_')}",
-  "ddg":      lambda q: f"http://openserp.alwaysdata.net/bing/search?text={q}",
+  "ddg":      lambda q: f"https://openserp.alwaysdata.net/bing/search?text={q}",
   "dict":     lambda q: f"https://api.dictionaryapi.dev/api/v2/entries/en/{q}",
   "country":  lambda q: f"https://restcountries.com/v3.1/name/{q}?fullText=true",
   "uni":      lambda q: f"http://universities.hipolabs.com/search?name={q}",
@@ -1343,23 +1388,71 @@ async def freeapi_query(request:Request):
     return J({"ok":bool(result),"result":result or "","api":api_key})
 
 # ── OpenSERP Bing Web Search (JSON, no API key needed) ────────────────────────
+# ── Simple in-memory TTL cache for OpenSERP — the free alwaysdata VPS is slow
+# and rate-sensitive, so identical queries within the TTL window are served
+# instantly instead of round-tripping again. Resets on restart (no disk needed).
+_SERP_CACHE = {}
+_SERP_CACHE_TTL = 900  # 15 minutes
+_SERP_CACHE_MAX = 300  # simple size cap to avoid unbounded growth
+
+def _openserp_query(query, timeout=12, retries=1):
+    """Query the self-hosted OpenSERP instance and return (instant, results).
+    Real response shape: {"results":[{title,url,snippet,domain,rank,...}],
+    "serp_features":[{"type":"ai_summary","text":...}, {"type":"related_searches",...}]}
+    NOT a flat list — this was the root cause of empty/'crappy' results before.
+    Cached in-memory for _SERP_CACHE_TTL seconds since the backing VPS is slow/free-tier."""
+    cache_key = query.strip().lower()
+    cached = _SERP_CACHE.get(cache_key)
+    if cached and (_time.time() - cached[0]) < _SERP_CACHE_TTL:
+        return cached[1], cached[2]
+    import urllib.parse as _uq
+    base = "https://openserp.alwaysdata.net/bing/search?text="
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = req.get(base + _uq.quote(query),
+                        headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},
+                        timeout=timeout)
+            if not r.ok:
+                last_err = f"HTTP {r.status_code}"; continue
+            data = r.json()
+            if not isinstance(data, dict):
+                last_err = "unexpected response shape"; continue
+            raw_results = data.get("results", []) or []
+            results = [{"title":it.get("title",""),
+                        "url":it.get("url",""),
+                        "snippet":it.get("snippet","") or it.get("description",""),
+                        "domain":it.get("domain","")}
+                       for it in raw_results if it.get("url") and it.get("type","organic")=="organic"]
+            if not results:  # fall back: include non-organic too if that's all we got
+                results = [{"title":it.get("title",""),"url":it.get("url",""),
+                            "snippet":it.get("snippet","") or it.get("description",""),
+                            "domain":it.get("domain","")} for it in raw_results if it.get("url")]
+            instant = ""
+            for feat in data.get("serp_features", []) or []:
+                if feat.get("type") == "ai_summary" and feat.get("text"):
+                    instant = feat["text"]; break
+            if results or instant:
+                if len(_SERP_CACHE) >= _SERP_CACHE_MAX:  # crude eviction: drop the oldest entry
+                    oldest = min(_SERP_CACHE, key=lambda k: _SERP_CACHE[k][0])
+                    _SERP_CACHE.pop(oldest, None)
+                _SERP_CACHE[cache_key] = (_time.time(), instant, results)
+            return instant, results
+        except Exception as ex:
+            last_err = str(ex)
+            continue
+    return "", []  # give up quietly after retries; caller decides how to report
+
 @app.post("/api/search/web")
 async def web_search_proxy(request:Request):
     """Bing search via OpenSERP — returns clean JSON results."""
-    import urllib.parse
     auth_user(request); d=await request.json()
     query=d.get("query","").strip()
     if not query: return J({"ok":False,"error":"query required","results":[]})
-    try:
-        url=f"http://openserp.alwaysdata.net/bing/search?text={urllib.parse.quote(query)}"
-        r=req.get(url,headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},timeout=10)
-        if not r.ok:
-            return J({"ok":False,"error":f"Search API returned {r.status_code}","results":[]})
-        raw=r.json()  # list of {title, url, description}
-        results=[{"title":item.get("title",""),"url":item.get("url",""),"snippet":item.get("description","")} for item in (raw if isinstance(raw,list) else []) if item.get("url")]
-        return J({"ok":True,"query":query,"instant":"","results":results[:10]})
-    except Exception as e:
-        return J({"ok":False,"error":str(e),"results":[]})
+    instant, results = _openserp_query(query, timeout=12, retries=1)
+    if not results and not instant:
+        return J({"ok":False,"error":"Search backend returned no results — it may be slow or temporarily down. Try again in a moment.","results":[]})
+    return J({"ok":True,"query":query,"instant":instant,"results":results[:10]})
 
 # Legacy alias — keeps old callers working
 @app.post("/api/search/ddg")
@@ -1954,15 +2047,11 @@ async def deep_research(request:Request):
     # 1. Grab Bing web context via OpenSERP (skip for math/code — not needed)
     web_ctx=""
     if mode=="general":
-        try:
-            sr=req.get(f"http://openserp.alwaysdata.net/bing/search?text={_up2.quote(prompt)}",
-                       headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},timeout=8)
-            if sr.ok:
-                items=sr.json() if isinstance(sr.json(),list) else []
-                for item in items[:5]:
-                    snip=item.get("description","") or item.get("snippet","")
-                    if snip: web_ctx+=snip[:250]+"\n"
-        except: pass
+        instant,items=_openserp_query(prompt,timeout=8)
+        if instant: web_ctx+=instant[:400]+"\n"
+        for item in items[:5]:
+            snip=item.get("snippet","")
+            if snip: web_ctx+=snip[:250]+"\n"
     if web_ctx: sys_p+=f"\n\nLive web context:\n{web_ctx[:800]}"
 
     base_msg=[{"role":"system","content":sys_p},{"role":"user","content":prompt}]
@@ -4183,7 +4272,23 @@ function apiFetch(url, opts) {
     var safeCity=(_userGeo.city||'').replace(/[^\x20-\x7E]/g,'').trim().substring(0,80);
     opts.headers['X-User-City']=safeCity;
   }
-  return fetch(url, opts);
+  return fetch(url, opts).then(function(r){
+    // Session died server-side (e.g. host restarted and lost its user store) —
+    // clear the stale token and prompt a clean re-login instead of leaking raw JSON.
+    if(r.status===401 && authToken && !url.includes('/api/login') && !url.includes('/api/register')){
+      if(!window._authExpiredNotified){
+        window._authExpiredNotified=true;
+        authToken=''; localStorage.removeItem('fusion_token'); if(typeof _delCookie==='function') _delCookie('fusion_token');
+        showToast('Your session expired — please sign in again');
+        setTimeout(function(){
+          var cp=document.getElementById('chatPage'), ap=document.getElementById('authPage');
+          if(cp) cp.classList.remove('active'); if(ap) ap.classList.add('active');
+          window._authExpiredNotified=false;
+        },300);
+      }
+    }
+    return r;
+  });
 }
 
 var ACCENTS = {
@@ -4898,7 +5003,7 @@ async function doForgotPw() {
     var r=await fetch('/api/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,new_password:p})});
     var d=await r.json();
     if(!r.ok){showAuthErr(d.error);btn.textContent='Reset Password \u2192';btn.disabled=false;return;}
-    showToast('\u2705 Password reset! Please sign in.'); document.getElementById('lUser').value=u; switchTab('login');
+    showToast('Password reset! Please sign in.'); document.getElementById('lUser').value=u; switchTab('login');
   }catch(e){showAuthErr('Connection error');}
   btn.textContent='Reset Password \u2192';btn.disabled=false;
 }
@@ -4936,7 +5041,7 @@ function launch() {
   _applyMenuToggles();
   setTimeout(_loadCustomEndpointUI, 600);
   if(window.speechSynthesis){loadVoices();loadVCVoices();window.speechSynthesis.onvoiceschanged=function(){loadVoices();loadVCVoices();};}
-  if(isDevUser){showToast('\u{1F6E0}\uFE0F Dev mode active');fetchDevStats();}
+  if(isDevUser){showToast('Dev mode active');fetchDevStats();}
 }
 
 async function savePref() {
@@ -4964,7 +5069,7 @@ async function saveKey(p) {
   try{
     var r=await apiFetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:p,key:k})});
     var d=await r.json();
-    if(!r.ok) return showToast('Error: '+d.error);setStat(p,true); inp.value=''; showToast('\u2705 '+p+' key saved');
+    if(!r.ok) return showToast('Error:'+d.error);setStat(p,true); inp.value=''; showToast(''+p+' key saved');
     loadKeys(); // refresh banner
   }catch(e){showToast('Error saving key');}
 }
@@ -5059,7 +5164,7 @@ function sendGenToChat(){
   if(res.b64){
     pendingImageB64=res.b64;pendingImageMime=res.mime||'image/png';pendingImageName='generated.png';
     document.getElementById('imgPrev').src='data:'+res.mime+';base64,'+res.b64;document.getElementById('imgPrevName').textContent='Generated image';
-    document.getElementById('imgPrevWrap').classList.add('show');closeSP();showToast('\uD83D\uDDBC\uFE0F Attached to chat');
+    document.getElementById('imgPrevWrap').classList.add('show');closeSP();showToast('\uD83D\uDDBC Attached to chat');
   }else if(res.url){
     document.getElementById('msgIn').value='[Image: '+res.url+'] '+res.prompt;ar(document.getElementById('msgIn'));closeSP();
   }
@@ -5076,7 +5181,7 @@ function attachImgFromChat(btn){
   var mime=acts&&acts.dataset.mime?acts.dataset.mime:'image/png';
   if(!b64)return showToast('No image data');pendingImageB64=b64;pendingImageMime=mime;pendingImageName='generated.png';
   document.getElementById('imgPrev').src='data:'+mime+';base64,'+b64;document.getElementById('imgPrevName').textContent='Generated image';
-  document.getElementById('imgPrevWrap').classList.add('show');showToast('\uD83D\uDDBC\uFE0F Attached \u2014 add message and send!');
+  document.getElementById('imgPrevWrap').classList.add('show');showToast('\uD83D\uDDBC Attached \u2014 add message and send!');
 }
 
 var _panelImgAbort = null;
@@ -5111,11 +5216,11 @@ async function generateImage(){
     if(!r.ok||d.ok===false){
       var msg=d.error||('HTTP '+r.status);
       var devMsg=d.dev_error?('\n\nDetail: '+d.dev_error):'';
-      showToast('❌ '+msg,8000);if(isDevUser&&d.dev_error) showErrOverlay('Image gen failed: '+d.dev_error);_genBtnDone('igGenBtn','imgStopBtn');
+      showToast(''+msg,8000);if(isDevUser&&d.dev_error) showErrOverlay('Image gen failed: '+d.dev_error);_genBtnDone('igGenBtn','imgStopBtn');
       return;
     }
     var src=d.b64?('data:'+(d.mime||'image/jpeg')+';base64,'+d.b64):(d.url||'');
-    if(!src){showToast('❌ No image in response',5000);_genBtnDone('igGenBtn','imgStopBtn');return;}
+    if(!src){showToast('No image in response',5000);_genBtnDone('igGenBtn','imgStopBtn');return;}
     _panelImgB64=d.b64||''; _panelImgMime=d.mime||'image/jpeg'; _panelImgUrl=d.url||'';
     if(img){
       img.style.cssText='width:100%;border-radius:10px;border:1px solid var(--glass-bdr2);display:block;cursor:zoom-in;margin-bottom:8px';img.src=src;
@@ -5129,9 +5234,9 @@ async function generateImage(){
       };
     }
     if(tag)tag.textContent='⚡ '+(d.backend||'Pollinations')+(d.b64?' · '+Math.round(d.b64.length*0.75/1024)+'KB':'');if(rw)rw.classList.add('show');
-    showToast('✅ Image ready!');
+    showToast('Image ready!');
   }catch(e){
-    if(e.name!=='AbortError')showToast('❌ '+e.message,6000);else showToast('⏹ Stopped');
+    if(e.name!=='AbortError')showToast(''+e.message,6000);else showToast('⏹ Stopped');
   }
   _genBtnDone('igGenBtn','imgStopBtn');
 }
@@ -5151,13 +5256,13 @@ function sendGenImgToChat(){
   if(_panelImgB64){
     pendingImageB64=_panelImgB64; pendingImageMime=_panelImgMime; pendingImageName='generated.png';
     document.getElementById('imgPrev').src='data:'+_panelImgMime+';base64,'+_panelImgB64;document.getElementById('imgPrevName').textContent='Generated image';
-    document.getElementById('imgPrevWrap').classList.add('show');closeSP(); showToast('📎 Attached! Add a message and send.');
+    document.getElementById('imgPrevWrap').classList.add('show');closeSP(); showToast('Attached! Add a message and send.');
   } else {
     // URL-only: embed directly in chat
     var bbl=addMsg('ai','',null,null);
     bbl.innerHTML='<img src="'+escHtml(src)+'" style="max-width:100%;border-radius:12px;border:1px solid var(--glass-bdr2);display:block;cursor:zoom-in" onclick="openImgFull(this.src)"/>'
       +'<br><span style="font-size:11px;color:var(--tx3)">Generated image — <a href="'+escHtml(src)+'" target="_blank" style="color:var(--blue)">open full size</a></span>';
-    hist.push({role:'assistant',content:'[Image generated]'});closeSP(); scrollDown(); showToast('💬 Sent to chat!');
+    hist.push({role:'assistant',content:'[Image generated]'});closeSP(); scrollDown(); showToast('Sent to chat!');
   }
 }
 
@@ -5178,7 +5283,7 @@ async function generateVideo(){
       signal:_videoAbort.signal,
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({prompt:prompt,model:model,width:w,height:h})});
-    if(!r.ok){var et=await r.text();var er={};try{er=JSON.parse(et);}catch(_){}showToast('❌ '+(er.error||'Video gen failed'),6000);_genBtnDone('videoGenBtn','videoStopBtn');return;}
+    if(!r.ok){var et=await r.text();var er={};try{er=JSON.parse(et);}catch(_){}showToast(''+(er.error||'Video gen failed'),6000);_genBtnDone('videoGenBtn','videoStopBtn');return;}
     var d=await r.json();
     var vid=document.getElementById('videoEl');
     var tag=document.getElementById('videoBackendTag');
@@ -5189,10 +5294,10 @@ async function generateVideo(){
     } else if(d.url){
       _videoUrl=d.url; _videoB64=''; _videoMime='video/mp4';
       if(vid){vid.src=d.url;vid.load();}
-    } else {showToast('❌ No video returned',5000);_genBtnDone('videoGenBtn','videoStopBtn');return;}
-    if(tag)tag.textContent='⚡ '+escHtml(d.backend||'Pollinations');if(res)res.style.display='';showToast('✅ Video ready!');
+    } else {showToast('No video returned',5000);_genBtnDone('videoGenBtn','videoStopBtn');return;}
+    if(tag)tag.textContent='⚡ '+escHtml(d.backend||'Pollinations');if(res)res.style.display='';showToast('Video ready!');
   }catch(e){
-    if(e.name!=='AbortError')showToast('❌ '+e.message,6000);else showToast('⏹ Stopped');
+    if(e.name!=='AbortError')showToast(''+e.message,6000);else showToast('⏹ Stopped');
   }
   _videoAbort=null;_genBtnDone('videoGenBtn','videoStopBtn');
 }
@@ -5217,7 +5322,7 @@ async function _doGen3DFromChat(prompt){
       if(src2){
         bbl.innerHTML='<img src="'+src2+'" style="max-width:100%;border-radius:12px;border:1px solid var(--glass-bdr2);display:block;cursor:zoom-in;margin-bottom:6px" onclick="openImgFull(this.src)"/>'
           +'<span style="font-size:10px;color:var(--tx3)">🧊 3D render · '+(d.backend||'Pollinations')+'</span>';
-        hist.push({role:'assistant',content:'[3D render: '+prompt+']'});showToast('✅ 3D ready!');
+        hist.push({role:'assistant',content:'[3D render: '+prompt+']'});showToast('3D ready!');
       }else bbl.innerHTML='<span style="color:var(--red)">❌ No 3D image returned</span>';
     }
   }catch(e){bbl.innerHTML='<span style="color:var(--red)">❌ '+escHtml(e.message)+'</span>';}
@@ -5236,7 +5341,7 @@ function sendVideoToChat(){
   var bbl=addMsg('ai','',null,null);
   bbl.innerHTML='<video controls style="width:100%;max-width:480px;border-radius:10px;border:1px solid var(--glass-bdr2)" src="'+vid.src+'"></video>'
     +'<br><span style="font-size:11px;color:var(--tx3)">Generated video</span>';
-  hist.push({role:'assistant',content:'[Video generated]'});closeSP(); scrollDown(); showToast('💬 Sent to chat!');
+  hist.push({role:'assistant',content:'[Video generated]'});closeSP(); scrollDown(); showToast('Sent to chat!');
 }
 
 var _threedAbort = null;
@@ -5258,7 +5363,7 @@ async function generate3D(){
       signal:_threedAbort.signal,
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({prompt:prompt,style:style,width:w,height:h})});
-    if(!r.ok){var et=await r.text();var er={};try{er=JSON.parse(et);}catch(_){}showToast('❌ '+(er.error||'3D gen failed'),6000);_genBtnDone('threedGenBtn','threedStopBtn');return;}
+    if(!r.ok){var et=await r.text();var er={};try{er=JSON.parse(et);}catch(_){}showToast(''+(er.error||'3D gen failed'),6000);_genBtnDone('threedGenBtn','threedStopBtn');return;}
     var d=await r.json();
     var img=document.getElementById('threedImg');
     var tag=document.getElementById('threedModelTag');
@@ -5273,7 +5378,7 @@ async function generate3D(){
         tdViewer.innerHTML='<div style="padding:16px;background:rgba(0,255,80,.08);border:1px solid rgba(0,255,80,.2);border-radius:10px;text-align:center"><div style="font-size:24px;margin-bottom:8px">🧊</div><div style="font-size:13px;color:var(--tx);font-weight:600">3D Model Ready (GLB)</div><div style="font-size:11px;color:var(--tx2);margin:6px 0">'+escHtml(d.backend||'HuggingFace')+'</div><a href="'+glbData+'" download="fusion-3d.glb" class="ig-btn" style="display:inline-block;margin-top:8px;padding:8px 18px;text-decoration:none">⬇️ Download .GLB</a></div>';
       }
       if(tag)tag.textContent='✅ Real 3D Model — '+escHtml(d.backend||'');
-      showToast('✅ 3D model ready! Download as .GLB');
+      showToast('3D model ready! Download as .GLB');
       _genBtnDone('threedGenBtn','threedStopBtn');
       if(res)res.style.display='';
       return;
@@ -5281,12 +5386,12 @@ async function generate3D(){
     if(tdViewer)tdViewer.style.display='none';
     if(img)img.style.display='';
     var src=d.b64?'data:'+d.mime+';base64,'+d.b64:(d.url||'');
-    if(!src){showToast('❌ No result returned',5000);_genBtnDone('threedGenBtn','threedStopBtn');return;}
+    if(!src){showToast('No result returned',5000);_genBtnDone('threedGenBtn','threedStopBtn');return;}
     _threedB64=d.b64||''; _threedMime=d.mime||'image/jpeg';if(img)img.src=src;
     if(tag)tag.textContent='⚡ '+escHtml(d.backend||'Pollinations')+(d.enhanced_prompt?' · '+escHtml(d.enhanced_prompt.slice(0,60))+'…':'');
-    if(res)res.style.display='';showToast('✅ 3D render ready!');
+    if(res)res.style.display='';showToast('3D render ready!');
   }catch(e){
-    if(e.name!=='AbortError')showToast('❌ '+e.message,6000);else showToast('⏹ Stopped');
+    if(e.name!=='AbortError')showToast(''+e.message,6000);else showToast('⏹ Stopped');
   }
   _threedAbort=null;_genBtnDone('threedGenBtn','threedStopBtn');
 }
@@ -5304,12 +5409,12 @@ function send3DToChat(){
   var bbl=addMsg('ai','',null,null);
   bbl.innerHTML='<img src="'+src+'" style="max-width:100%;border-radius:12px;border:1px solid var(--glass-bdr2);display:block;cursor:zoom-in" onclick="openImgFull(this.src)"/>'
     +'<br><span style="font-size:11px;color:var(--tx3)">3D render</span>';
-  hist.push({role:'assistant',content:'[3D render generated]'});closeSP(); scrollDown(); showToast('💬 Sent to chat!');
+  hist.push({role:'assistant',content:'[3D render generated]'});closeSP(); scrollDown(); showToast('Sent to chat!');
 }
 
 async function generateMusic() {
   var prompt=document.getElementById('musicPrompt').value.trim();
-  if(!prompt) return showToast('Enter a music prompt');showToast('🎵 Music generation coming soon — use Browser TTS for speech',5000);
+  if(!prompt) return showToast('Enter a music prompt');showToast('Music generation coming soon — use Browser TTS for speech',5000);
 }
 
 async function generateSpeech(){
@@ -5322,16 +5427,16 @@ async function generateSpeech(){
       signal:_genAbortCtrl?_genAbortCtrl.signal:undefined,
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({text:text,voice:voice})});
-    if(!r.ok){var er=await r.json();showToast('❌ '+(er.error||'TTS failed')+' — browser TTS used',5000);browserTTS();_genBtnDone('speechGenBtn','speechStopBtn');return;}
+    if(!r.ok){var er=await r.json();showToast(''+(er.error||'TTS failed')+' — browser TTS used',5000);browserTTS();_genBtnDone('speechGenBtn','speechStopBtn');return;}
     var d=await r.json();
     if(d.b64){
       var au=document.getElementById('speechAudio');
       au.src='data:'+d.mime+';base64,'+d.b64;document.getElementById('speechResult').classList.add('show');
       var dl=document.getElementById('speechDlBtn');
       if(dl){dl.style.display='';dl.onclick=function(){_downloadB64(d.b64,d.mime,'fusion-speech.mp3');};}
-      au.play();showToast('✅ Speech ready!');
+      au.play();showToast('Speech ready!');
     }
-  }catch(e){if(e.name!=='AbortError'){showToast('❌ '+e.message,5000);browserTTS();}}
+  }catch(e){if(e.name!=='AbortError'){showToast(''+e.message,5000);browserTTS();}}
   _genBtnDone('speechGenBtn','speechStopBtn');
 }
 
@@ -5346,7 +5451,7 @@ function browserTTS() {
     ||voices.find(function(v){return v.lang.startsWith('en');})
     ||voices[0];
   if(preferred) utt.voice=preferred;utt.rate=1; utt.pitch=1;window.speechSynthesis.cancel();window.speechSynthesis.speak(utt);
-  showToast('\u{1F50A} Speaking with browser TTS: '+(preferred?preferred.name:'default'));
+  showToast('Speaking with browser TTS:'+(preferred?preferred.name:'default'));
 }
 function loadVCVoices() {
   var sel=document.getElementById('vcVoiceSelect'); if(!sel) return;
@@ -5404,7 +5509,7 @@ function renderSaved(items){
 }
 async function saveMessage(content){
   var title=content.slice(0,60)+(content.length>60?'\u2026':'');
-  try{var r=await apiFetch('/api/saved',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title,content:content})});var d=await r.json();if(r.ok){showToast('\u{1F516} Saved!');loadSaved();}else showToast('Error: '+d.error);}catch(e){showToast('Error saving');}
+  try{var r=await apiFetch('/api/saved',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title,content:content})});var d=await r.json();if(r.ok){showToast('Saved!');loadSaved();}else showToast('Error:'+d.error);}catch(e){showToast('Error saving');}
 }
 async function deleteSaved(id){await apiFetch('/api/saved/'+id,{method:'DELETE'});loadSaved();showToast('Deleted');}
 function loadSavedItem(enc){var c=decodeURIComponent(enc);closeSP();document.getElementById('msgIn').value=c;ar(document.getElementById('msgIn'));document.getElementById('msgIn').focus();}
@@ -5419,7 +5524,7 @@ function renderMemory(items){
 async function addMemory(){
   var k=document.getElementById('memKey').value.trim(),v=document.getElementById('memVal').value.trim();
   if(!k||!v) return showToast('Enter key and value');
-  try{await apiFetch('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});document.getElementById('memKey').value='';document.getElementById('memVal').value='';loadMemory();showToast('\u{1F9E0} Memory saved');}catch(e){showToast('Error');}
+  try{await apiFetch('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});document.getElementById('memKey').value='';document.getElementById('memVal').value='';loadMemory();showToast('Memory saved');}catch(e){showToast('Error');}
 }
 async function delMemory(enc){var key=decodeURIComponent(enc);await apiFetch('/api/memory/'+encodeURIComponent(key),{method:'DELETE'});loadMemory();showToast('Memory removed');}
 
@@ -5516,7 +5621,7 @@ async function devToggleModel(key,enabled){
   try{
     await apiFetch('/api/dev/model-enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key,enabled:enabled})});
     showToast((enabled?'✅ Enabled: ':'🚫 Disabled: ')+key);
-  }catch(e){showToast('Error: '+e.message);}
+  }catch(e){showToast('Error:'+e.message);}
 }
 async function devToggleAllModels(enabled){
   var keys=allModels.map(function(m){return m.key;});
@@ -5672,21 +5777,21 @@ async function devBanUser(uid,username){
   var reason=prompt('Ban reason for @'+username+' (shown to admin):','Violation of TOS');
   if(!reason)return;
   try{var r=await apiFetch('/api/dev/user/'+uid+'/ban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:reason})});var d=await r.json();showToast(d.message||'Banned');renderUsersTab(document.getElementById('devModalBody'));}
-  catch(e){showToast('Error: '+e.message);}
+  catch(e){showToast('Error:'+e.message);}
 }
 async function devUnbanUser(uid,username){
   try{var r=await apiFetch('/api/dev/user/'+uid+'/unban',{method:'POST'});var d=await r.json();showToast(d.message||'Unbanned');renderUsersTab(document.getElementById('devModalBody'));}
-  catch(e){showToast('Error: '+e.message);}
+  catch(e){showToast('Error:'+e.message);}
 }
 async function devResetKeys(uid,username){
   if(!confirm('Reset all API keys for @'+username+'?'))return;
   try{var r=await apiFetch('/api/dev/user/'+uid+'/reset_keys',{method:'POST'});var d=await r.json();showToast(d.message||'Keys reset');}
-  catch(e){showToast('Error: '+e.message);}
+  catch(e){showToast('Error:'+e.message);}
 }
 async function devDeleteUser(uid,username){
   if(!confirm('Permanently delete @'+username+' and all their data?'))return;
   try{var r=await apiFetch('/api/dev/user/'+uid+'/delete',{method:'DELETE'});var d=await r.json();showToast(d.message||'Deleted');renderUsersTab(document.getElementById('devModalBody'));}
-  catch(e){showToast('Error: '+e.message);}
+  catch(e){showToast('Error:'+e.message);}
 }
 
 async function renderLogsTab(body){
@@ -5723,8 +5828,8 @@ async function devSearchLogs(){
   devLoadLogs('/api/dev/search-logs?q='+encodeURIComponent(q));
 }
 async function devExportLogs(){
-  try{var r=await apiFetch('/api/dev/export-logs');var d=await r.json();var blob=new Blob([JSON.stringify(d.logs,null,2)],{type:'application/json'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='fusion-logs-'+new Date().toISOString().slice(0,10)+'.json';a.click();showToast('✅ Exported '+d.exported+' log entries');}
-  catch(e){showToast('Export error: '+e.message);}
+  try{var r=await apiFetch('/api/dev/export-logs');var d=await r.json();var blob=new Blob([JSON.stringify(d.logs,null,2)],{type:'application/json'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='fusion-logs-'+new Date().toISOString().slice(0,10)+'.json';a.click();showToast('Exported'+d.exported+' log entries');}
+  catch(e){showToast('Export error:'+e.message);}
 }
 
 async function renderFlagsTab(body){
@@ -5760,11 +5865,11 @@ async function devToggleFlag(key,btn){
     var r=await apiFetch('/api/dev/feature-flags');var flags=await r.json();
     flags[key]=newVal;
     var r2=await apiFetch('/api/dev/feature-flags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(flags)});
-    if(!r2.ok){showToast('❌ Failed to save flag');return;}
+    if(!r2.ok){showToast('Failed to save flag');return;}
     btn.dataset.val=newVal?'1':'0';btn.textContent=newVal?'ON':'OFF';
     btn.style.background=newVal?'rgba(34,197,94,.2)':'rgba(124,58,237,.2)';btn.style.color=newVal?'var(--green)':'var(--red)';
     showToast((newVal?'✅':'🚫')+' '+key+' = '+newVal);
-  }catch(e){showToast('Error: '+e.message);}
+  }catch(e){showToast('Error:'+e.message);}
 }
 
 async function renderLimitsTab(body){
@@ -5800,8 +5905,8 @@ async function devSaveLimits(){
     var fields=['global_rpm','per_user_rpm','image_per_user_hour'];
     fields.forEach(function(k){var el=document.getElementById('rl_'+k);if(el&&!isNaN(parseInt(el.value)))lim[k]=parseInt(el.value);});
     var r2=await apiFetch('/api/dev/rate-limits',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(lim)});
-    if(r2.ok)showToast('✅ Rate limits saved');else showToast('❌ Failed');
-  }catch(e){showToast('Error: '+e.message);}
+    if(r2.ok)showToast('Rate limits saved');else showToast('Failed');
+  }catch(e){showToast('Error:'+e.message);}
 }
 async function devToggleEmergency(btn){
   var cur=btn.dataset.val==='1';
@@ -5811,7 +5916,7 @@ async function devToggleEmergency(btn){
     var r=await apiFetch('/api/dev/rate-limits');var lim=await r.json();
     lim.emergency_stop=newVal;await apiFetch('/api/dev/rate-limits',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(lim)});
     showToast(newVal?'🚨 Emergency stop ACTIVATED':'✅ Emergency stop deactivated');renderLimitsTab(document.getElementById('devModalBody'));
-  }catch(e){showToast('Error: '+e.message);}
+  }catch(e){showToast('Error:'+e.message);}
 }
 
 function renderConsoleTab(body){
@@ -5926,7 +6031,7 @@ async function runModelTest(){
   var btn=document.getElementById('runTestBtn');if(btn){btn.disabled=true;btn.textContent='\u23F3 Testing...';}
   var body=document.getElementById('devModalBody');
   body.innerHTML='<button class="run-test-btn" disabled>\u23F3 Testing (~20s)...</button><div style="color:var(--tx3);font-size:12px;margin-bottom:12px">Pinging every model simultaneously...</div>';
-  try{var r=await apiFetch('/api/test');if(!r.ok){showToast('Test failed: '+r.status);return;}devTestResults=await r.json();renderModelsTab(body);}
+  try{var r=await apiFetch('/api/test');if(!r.ok){showToast('Test failed:'+r.status);return;}devTestResults=await r.json();renderModelsTab(body);}
   catch(e){body.innerHTML='<div style="color:var(--red);padding:20px">Test error: '+escHtml(e.message)+'</div>';}
 }
 function renderActivityTab(body){
@@ -5946,7 +6051,7 @@ function renderVisitorsTab(body){
   }else h+='<div style="font-size:12px;color:var(--tx3)">No data yet</div>';
   h+='</div><button class="ghost-btn" style="font-size:12px;padding:8px;margin-top:8px" onclick="refreshDevStats()">\u{1F504} Refresh</button>';body.innerHTML=h;
 }
-async function refreshDevStats(){devStats=null;await fetchDevStats();renderModalTab(currentModalTab);showToast('\u2705 Refreshed');}
+async function refreshDevStats(){devStats=null;await fetchDevStats();renderModalTab(currentModalTab);showToast('Refreshed');}
 
 function openCamera(){document.getElementById('cameraInput').click();}
 function handleImageFile(e){
@@ -5970,9 +6075,9 @@ async function handleFileUpload(e){
   if(isText){var reader=new FileReader();reader.onload=function(ev){
     pendingFileText=ev.target.result;
     window._lastAttachedFile={name:file.name,size:file.size,preview:ev.target.result.slice(0,400)};
-    showToast('📄 '+file.name+' ready');
+    showToast(''+file.name+' ready');
   };reader.readAsText(file);}
-  else{pendingFileText='[Binary file: '+file.name+', size: '+fmtSize(file.size)+']';showToast('\u{1F4CE} '+file.name+' attached');}
+  else{pendingFileText='[Binary file: '+file.name+', size: '+fmtSize(file.size)+']';showToast(''+file.name+' attached');}
   e.target.value='';
 }
 function clearFile(){pendingFileText='';pendingFileName='';pendingFileSize=0;document.getElementById('filePrevWrap').classList.remove('show');}
@@ -6260,7 +6365,7 @@ function _genFileCard(name, content){
 
 async function _ffcBinaryDl(btn,cardId,endpoint,filename,theme){
   var content=_ffc_content_map[cardId]||'';
-  if(!content){showToast('⚠️ Content not found — try regenerating');return;}
+  if(!content){showToast('Content not found — try regenerating');return;}
   btn.textContent='⏳ Generating…'; btn.disabled=true;
   try{
     var resp=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:content,filename:filename,theme:theme||'dark'})});
@@ -6274,7 +6379,7 @@ async function _ffcBinaryDl(btn,cardId,endpoint,filename,theme){
   }catch(ex){
     btn.textContent='❌ '+ex.message; btn.disabled=false;
     setTimeout(function(){btn.textContent='⬇ Download '+filename.split('.').pop().toUpperCase();btn.disabled=false;},3000);
-    showToast('⚠️ '+ex.message);
+    showToast(''+ex.message);
   }
 }
 
@@ -6559,7 +6664,7 @@ function _openCodeWindow(wid){
 function _closeCodeWindow(){ var ov=document.getElementById('codeWinOverlay'); if(ov) ov.remove(); }
 function _copyCodeWindow(wid){
   var entry=_codeWindowStore[wid]; if(!entry) return;
-  navigator.clipboard.writeText(entry.code).then(function(){ showToast('✅ Code copied'); });
+  navigator.clipboard.writeText(entry.code).then(function(){ showToast('Code copied'); });
 }
 function _downloadCodeWindow(wid){
   var entry=_codeWindowStore[wid]; if(!entry) return;
@@ -6655,7 +6760,7 @@ async function newConv() {
   // Lazy creation: don't create server-side until first message
   currentConvId=null; hist=[];
   document.getElementById('msgs').innerHTML='';
-  showWelcome(); closeSP(); showToast('✨ New conversation — start typing!');
+  showWelcome(); closeSP(); showToast('New conversation — start typing!');
   loadConvs();
 }
 
@@ -6665,7 +6770,7 @@ async function loadConv(cid) {
     var d=await r.json();
     currentConvId=cid;hist=[];document.getElementById('msgs').innerHTML='';
     document.getElementById('ws') && (document.getElementById('ws').style.display='none');
-    showToast('💬 Loading: '+escHtml((d.title||'Chat').slice(0,40)));
+    showToast('Loading:'+escHtml((d.title||'Chat').slice(0,40)));
     // Render all messages and rebuild full AI context history
     (d.messages||[]).forEach(function(m){
       if(m.role==='user'){
@@ -6680,7 +6785,7 @@ async function loadConv(cid) {
         bbl.closest('.mcont').appendChild(acts);
       }
     });
-    loadConvs();closeSP();scrollDown();showToast('💬 Loaded: '+d.title);
+    loadConvs();closeSP();scrollDown();showToast('Loaded:'+d.title);
   }catch(e){showToast('Failed to load conversation');}
 }
 
@@ -6689,7 +6794,7 @@ async function deleteConv(cid) {
   try{
     await apiFetch('/api/conversations/'+cid,{method:'DELETE'});
     if(currentConvId===cid){resetChat();}
-    loadConvs();showToast('🗑️ Deleted');
+    loadConvs();showToast('Deleted');
   }catch(e){showToast('Delete failed');}
 }
 
@@ -6883,7 +6988,7 @@ async function _doGenerate(prompt, mkey) {
           acts.dataset.b64=id.b64||'';acts.dataset.mime=id.mime||'image/png';
           acts.innerHTML='<button class="mact" onclick="downloadImgFromChat(this)">⬇ Download</button><button class="mact" onclick="attachImgFromChat(this)">Attach to Chat</button>';
           bbl.closest('.mcont').appendChild(acts);_lastGenResult={type:'image',b64:id.b64||'',mime:id.mime||'image/png',url:id.url||'',prompt:prompt};
-          hist.push({role:'assistant',content:'[Image generated: '+prompt+']'});showToast('✅ Image generated!');
+          hist.push({role:'assistant',content:'[Image generated: '+prompt+']'});showToast('Image generated!');
         }else{bbl.innerHTML='<span style="color:var(--red)">❌ No image data returned</span>';}
       }
     }catch(e){bbl.innerHTML='<span style="color:var(--red)">❌ '+escHtml(e.message)+'</span>';}
@@ -6895,6 +7000,9 @@ async function _doGenerate(prompt, mkey) {
   try{
     var payload={message:prompt,history:hist.slice(0,-1),model_key:mkey==='auto'?null:mkey,
       image_b64:'',image_mime:'image/jpeg',file_text:''};
+    if(mkey==='custom_ep'&&_customEndpointData&&_customEndpointData.url){
+      payload.custom_endpoint={url:_customEndpointData.url,model:_customEndpointData.model||'default',key:_customEndpointData.key||''};
+    }
     var res=await apiFetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     if(!res.ok){
       var errText2=await res.text(); var err2={};
@@ -7060,7 +7168,7 @@ async function _doGenImgFromChat(prompt, answers) {
           +'<button class="mact" onclick="_attachGenImgData(\''+escHtml(d.b64||'')+'\',\''+escHtml(d.mime||'image/jpeg')+'\')">📎 Use in Chat</button>'
           +'</div></div></div>';
         _lastGenResult={type:'image',b64:d.b64||'',mime:d.mime||'image/jpeg',url:d.url||'',prompt:full};hist.push({role:'assistant',content:'[Image: '+full+']'});
-        showToast('✅ Image ready!');
+        showToast('Image ready!');
       } else {
         bbl.innerHTML='<span style="color:var(--red)">❌ No image returned. Please try again.</span>';
       }
@@ -7090,7 +7198,7 @@ function _attachGenImgData(b64, mime) {
   if(!b64){showToast('URL-only images cannot be attached');return;}
   pendingImageB64=b64; pendingImageMime=mime; pendingImageName='generated.png';document.getElementById('imgPrev').src='data:'+mime+';base64,'+b64;
   document.getElementById('imgPrevName').textContent='Generated image';document.getElementById('imgPrevWrap').classList.add('show');
-  showToast('📎 Attached to chat!');
+  showToast('Attached to chat!');
 }
 
 async function _doGenVideoFromChat(prompt) {
@@ -7115,7 +7223,7 @@ document.addEventListener('click',function(e){
 });
 function setChatFontSize(sz){
   var cb=document.getElementById('chatBody');if(!cb)return;
-  cb.style.fontSize=sz==='small'?'13px':sz==='large'?'17px':'15px';closeChatOpts();showToast('Text: '+sz);
+  cb.style.fontSize=sz==='small'?'13px':sz==='large'?'17px':'15px';closeChatOpts();showToast('Text:'+sz);
 }
 function exportChat(){
   var msgs=document.getElementById('msgs');if(!msgs)return showToast('No chat');
@@ -7126,7 +7234,7 @@ function exportChat(){
   if(!lines.length)return showToast('Nothing to export');
   var blob=new Blob([lines.join('\n\n')],{type:'text/plain'});
   var a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  a.download='fusion-chat-'+new Date().toISOString().slice(0,10)+'.txt';a.click();closeChatOpts();showToast(' Exported!');
+  a.download='fusion-chat-'+new Date().toISOString().slice(0,10)+'.txt';a.click();closeChatOpts();showToast('Exported!');
 }
 
 async function _tryFreeAPI(text){
@@ -7361,7 +7469,7 @@ function saveCustomEndpoint(){
   // Also save key to server
   if(key) apiFetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:'custom_endpoint',key:key})});
   if(url) apiFetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:'extra',key:url+(model?'||'+model:'')})});
-  showToast('\u2705 Custom endpoint saved');
+  showToast('Custom endpoint saved');
   var st=document.getElementById('customEndpointStat');if(st)st.textContent='Saved';
   // Add to model selector
   _addCustomModelOption(url,model);
@@ -7421,7 +7529,7 @@ function sendScrapedToChat(){
   if(!_scraperData||!_scraperData.text){showToast('Scrape a URL first');return;}
   var txt='[Scraped: '+(_scraperData.title||_scraperData.url)+']\n\n'+_scraperData.text.slice(0,3000);
   document.getElementById('msgIn').value=txt;ar(document.getElementById('msgIn'));
-  closeSP();document.getElementById('msgIn').focus();showToast('\u{1F4CB} Scraped content added to input');
+  closeSP();document.getElementById('msgIn').focus();showToast('Scraped content added to input');
 }
 
 (async function(){
@@ -7670,7 +7778,7 @@ function _arenaUse(){
   bbl2.innerHTML=fmt(_arenaChosenText);
   hist.push({role:'assistant',content:_arenaChosenText});
   _renderMath(bbl2);
-  showToast('✅ Answer added to chat');
+  showToast('Answer added to chat');
 }
 
 // ══ Extreme Deep Think ═════════════════════════════════════════════════════
@@ -8801,6 +8909,7 @@ async function _fosMonRef(id){
       +'<span style="font-size:11px;color:'+(d.groq?'#7ee8a2':'#ff8484')+'">●  Groq '+(d.groq?'online':'offline')+'</span>'
       +'<span style="font-size:11px;color:'+(d.openrouter?'#7ee8a2':'#ff8484')+'">●  OpenRouter '+(d.openrouter?'online':'offline')+'</span>'
       +'<span style="font-size:11px;color:'+(d.chromium?'#7ee8a2':'#ff8484')+'">●  Chromium '+(d.chromium?'ready':'not installed')+'</span>'
+      +'<span style="font-size:11px;color:'+(d.persistent_disk?'#7ee8a2':'#facc15')+'" title="'+(d.persistent_disk?'':'No persistent disk mounted — user logins and data will reset whenever this host restarts (e.g. Render free tier spin-down). Mount a disk at /data to fix this.')+'">●  Storage '+(d.persistent_disk?'persistent':'ephemeral ('+(d.data_dir||'?')+')')+'</span>'
       +'</div></div>'
       +'<div class="fos-mcard"><div class="fos-mlbl">Platform</div><div class="fos-mval" style="font-size:9.5px">'+escHtml(d.platform||'')+'</div></div>';
   }catch(e){}
@@ -8860,10 +8969,10 @@ async function runSvgGen(){
     var canvas=document.getElementById('svgCanvas'); canvas.width=W; canvas.height=H;
     var ctx=canvas.getContext('2d'); var blob=new Blob([d.svg],{type:'image/svg+xml'});
     var url=URL.createObjectURL(blob); var img=new Image();
-    img.onload=function(){ ctx.drawImage(img,0,0,W,H); URL.revokeObjectURL(url); _svgB64=canvas.toDataURL('image/png').split(',')[1]; document.getElementById('svgPreviewBox').style.display='block'; ['svgDlBtn','svgChatBtn'].forEach(function(x){document.getElementById(x).style.display='inline-block';}); showToast('🎨 Generated!'); };
+    img.onload=function(){ ctx.drawImage(img,0,0,W,H); URL.revokeObjectURL(url); _svgB64=canvas.toDataURL('image/png').split(',')[1]; document.getElementById('svgPreviewBox').style.display='block'; ['svgDlBtn','svgChatBtn'].forEach(function(x){document.getElementById(x).style.display='inline-block';}); showToast('Generated!'); };
     img.onerror=function(){ document.getElementById('svgPreviewBox').innerHTML='<div style="padding:10px">'+d.svg+'</div>'; document.getElementById('svgPreviewBox').style.display='block'; };
     img.src=url;
-  }catch(e){showToast('❌ '+e.message);}
+  }catch(e){showToast(''+e.message);}
   btn.textContent='✨ Generate Art'; btn.disabled=false;
 }
 function svgDownload(){ if(!_svgB64){showToast('Generate first');return;} var a=document.createElement('a'); a.href='data:image/png;base64,'+_svgB64; a.download='fusion-art.png'; a.click(); }
@@ -9052,15 +9161,11 @@ async def api_extreme_think(request: Request):
 
     # ── Phase 1: 12 web searches (varied angles) ─────────────────────────
     def _bing_search(q):
-        try:
-            import urllib.parse as _up4
-            r=req.get(f"http://openserp.alwaysdata.net/bing/search?text={_up4.quote(q)}",
-                      headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},timeout=8)
-            if r.ok:
-                items=r.json() if isinstance(r.json(),list) else []
-                snippets=" | ".join((item.get("description","") or item.get("snippet",""))[:180] for item in items[:4] if item.get("description") or item.get("snippet"))
-                if snippets: return f"[{q}]: {snippets}"
-        except: pass
+        instant,items=_openserp_query(q,timeout=8)
+        parts=[]
+        if instant: parts.append(instant[:180])
+        parts+=[it.get("snippet","")[:180] for it in items[:4] if it.get("snippet")]
+        if parts: return f"[{q}]: "+" | ".join(parts)
         return ""
 
     search_angles=[
@@ -9628,13 +9733,32 @@ def _fos_run(cmd, cwd, timeout=30):
         return "", str(ex), 1
 
 # ── Real headless Chromium — used by the FusionOS Browser app ────────────────
-_CHROMIUM_BIN_CACHE = {"path": None, "checked": False}
-def _find_chromium():
-    """Locate a real Chromium/Chrome binary on the host, cached after first check."""
+_CHROMIUM_BIN_CACHE = {"path": None, "checked": False, "install_tried": False}
+def _find_chromium(try_install=True):
+    """Locate a real Chromium/Chrome binary on the host, cached after first check.
+    If none is found and try_install is True, attempt a one-time silent install
+    via apt-get (works on most Debian/Ubuntu-based hosts running as root)."""
     if _CHROMIUM_BIN_CACHE["checked"]: return _CHROMIUM_BIN_CACHE["path"]
-    for name in ("chromium","chromium-browser","google-chrome","google-chrome-stable","chrome"):
+    names = ("chromium","chromium-browser","google-chrome","google-chrome-stable","chrome")
+    extra_paths = ("/usr/bin/chromium","/usr/bin/chromium-browser","/usr/bin/google-chrome",
+                   "/snap/bin/chromium","/usr/lib/chromium/chromium","/usr/lib/chromium-browser/chromium-browser")
+    for name in names:
         p = _sh.which(name)
         if p: _CHROMIUM_BIN_CACHE.update(path=p, checked=True); return p
+    for p in extra_paths:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            _CHROMIUM_BIN_CACHE.update(path=p, checked=True); return p
+    if try_install and not _CHROMIUM_BIN_CACHE["install_tried"]:
+        _CHROMIUM_BIN_CACHE["install_tried"] = True
+        try:
+            # Best-effort, silent, short-timeout install — safe no-op if not root / no apt / no network.
+            subprocess.run("apt-get update -qq && apt-get install -y -qq chromium chromium-browser 2>/dev/null || true",
+                            shell=True, timeout=90, capture_output=True)
+        except Exception:
+            pass
+        for name in names:
+            p = _sh.which(name)
+            if p: _CHROMIUM_BIN_CACHE.update(path=p, checked=True); return p
     _CHROMIUM_BIN_CACHE["checked"] = True
     return None
 
@@ -9860,7 +9984,8 @@ async def api_fos_stats(request: Request):
                "uptime_s":round(_time.time()-_SERVER_START,1),
                "disk_total_gb":round(du.total/1e9,1),"disk_used_gb":round(du.used/1e9,1),"disk_free_gb":round(du.free/1e9,1),
                "groq":bool(GROQ_KEY.strip()),"openrouter":bool(OPENROUTER_KEY.strip()),
-               "chromium":bool(_find_chromium())})
+               "chromium":bool(_find_chromium(try_install=False)),
+               "persistent_disk":_PERSISTENT_DISK,"data_dir":_data_dir})
 
 # ── AI Computer (Perplexity-style) with parallel page fetch ──────────────────
 @app.post("/api/computer")
@@ -9870,14 +9995,12 @@ async def api_computer(request: Request):
     query=d.get("query","").strip(); depth=d.get("depth","normal")
     num_src=int(d.get("num_sources",6)); t0=_t5.time(); sources=[]
     try:
-        br=req.get(f"http://openserp.alwaysdata.net/bing/search?text={_up.quote(query)}",
-                    headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},timeout=9)
-        if br.ok:
-            items=br.json() if isinstance(br.json(),list) else []
-            for item in items[:num_src+3]:
-                t2=item.get("title",""); ru=item.get("url",""); sn=item.get("description","") or item.get("snippet","")
-                if t2 and ru and ru.startswith("http") and not any(s["url"]==ru for s in sources):
-                    sources.append({"title":t2,"url":ru,"snippet":sn[:400],"full":sn})
+        _instant,items=_openserp_query(query,timeout=9)
+        if _instant: sources.append({"title":"Web summary","url":"https://www.bing.com/search?q="+_up.quote(query),"snippet":_instant[:600],"full":_instant})
+        for item in items[:num_src+3]:
+            t2=item.get("title",""); ru=item.get("url",""); sn=item.get("snippet","")
+            if t2 and ru and ru.startswith("http") and not any(s["url"]==ru for s in sources):
+                sources.append({"title":t2,"url":ru,"snippet":sn[:400],"full":sn})
     except: pass
     fetch_n={"fast":2,"normal":3,"deep":5}.get(depth,3); ptmo=6
     skip=["youtube.com","reddit.com","facebook.com","twitter.com","instagram.com","tiktok.com"]
