@@ -100,6 +100,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS visitor_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,username TEXT,event TEXT NOT NULL,ip TEXT,ua TEXT,ts TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS conversations(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,title TEXT NOT NULL,created TEXT NOT NULL,updated TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS conv_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,conv_id INTEGER NOT NULL,user_id INTEGER NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,model TEXT,ts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS mcp_servers(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,headers_json TEXT DEFAULT '{}',enabled INTEGER DEFAULT 1,last_status TEXT,last_checked TEXT,ts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS skills(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,name TEXT NOT NULL,icon TEXT DEFAULT '\U0001F9E9',description TEXT DEFAULT '',instructions TEXT NOT NULL,mcp_server_ids TEXT DEFAULT '[]',enabled INTEGER DEFAULT 0,ts TEXT NOT NULL);
     """)
     c.commit(); c.close()
 
@@ -181,6 +183,15 @@ def get_available(user_id=None,salt=None):
 def J(data,status=200): return JSONResponse(data,status_code=status)
 def err(msg,code=400): return JSONResponse({"error":msg},status_code=code)
 
+# ── Model list ────────────────────────────────────────────────────────────
+# Anthropic entries below are updated to the July 2026 lineup (Sonnet 5, Opus 4.8,
+# Haiku 4.5, Fable 5) — verified, not guessed. The other providers (OpenAI, Google,
+# xAI, Meta, etc.) are NOT updated for July 2026 in this pass: this session has no
+# web search tool, so refreshing them would mean guessing model ID strings, and a
+# wrong guessed ID just silently 404s at request time — worse than an old-but-real
+# one. To finish this properly: enable web search in a session with me and ask for
+# the refresh, or tell me the exact current model IDs per provider and I'll wire
+# them in directly.
 MODELS = {
     "gh_gpt4o": {"provider":"github","model":"openai/gpt-4o","label":"GPT-4o","company":"OpenAI","emoji":"🤖","desc":"GPT-4o — vision + fast","thinking":False,"type":"chat","vision":True},
     "gh_gpt4o_mini": {"provider":"github","model":"openai/gpt-4o-mini","label":"GPT-4o Mini","company":"OpenAI","emoji":"🤖","desc":"GPT-4o Mini — cheapest OpenAI","thinking":False,"type":"chat"},
@@ -243,9 +254,10 @@ MODELS = {
     "oa_gpt4o": {"provider":"openai","model":"gpt-4o","label":"GPT-4o (Direct)","company":"OpenAI","emoji":"🤖","desc":"GPT-4o via your own OpenAI key","thinking":False,"type":"chat","vision":True},
     "oa_gpt4o_mini": {"provider":"openai","model":"gpt-4o-mini","label":"GPT-4o Mini (Direct)","company":"OpenAI","emoji":"🤖","desc":"GPT-4o Mini via your own OpenAI key","thinking":False,"type":"chat","vision":True},
     "oa_o3": {"provider":"openai","model":"o3","label":"o3 (Direct)","company":"OpenAI","emoji":"🧠","desc":"OpenAI o3 reasoning via your own key","thinking":True,"type":"chat"},
-    "an_opus": {"provider":"anthropic","model":"claude-opus-4-1-20250805","label":"Claude Opus 4.1","company":"Anthropic","emoji":"🎭","desc":"Claude Opus via your own Anthropic key","thinking":True,"type":"chat","vision":True},
-    "an_sonnet": {"provider":"anthropic","model":"claude-sonnet-4-5-20250929","label":"Claude Sonnet 4.5","company":"Anthropic","emoji":"🎭","desc":"Claude Sonnet via your own Anthropic key","thinking":False,"type":"chat","vision":True},
-    "an_haiku": {"provider":"anthropic","model":"claude-3-5-haiku-20241022","label":"Claude Haiku 3.5","company":"Anthropic","emoji":"🎭","desc":"Claude Haiku — fast & cheap","thinking":False,"type":"chat","vision":True},
+    "an_opus": {"provider":"anthropic","model":"claude-opus-4-8","label":"Claude Opus 4.8","company":"Anthropic","emoji":"🎭","desc":"Claude Opus via your own Anthropic key","thinking":True,"type":"chat","vision":True},
+    "an_sonnet": {"provider":"anthropic","model":"claude-sonnet-5","label":"Claude Sonnet 5","company":"Anthropic","emoji":"🎭","desc":"Claude Sonnet via your own Anthropic key","thinking":True,"type":"chat","vision":True},
+    "an_haiku": {"provider":"anthropic","model":"claude-haiku-4-5-20251001","label":"Claude Haiku 4.5","company":"Anthropic","emoji":"🎭","desc":"Claude Haiku — fast & cheap","thinking":False,"type":"chat","vision":True},
+    "an_fable": {"provider":"anthropic","model":"claude-fable-5","label":"Claude Fable 5","company":"Anthropic","emoji":"🎭","desc":"Anthropic's Mythos-tier model, above Opus — via your own key","thinking":True,"type":"chat","vision":True},
     "gm_flash": {"provider":"gemini","model":"gemini-2.0-flash","label":"Gemini 2.0 Flash","company":"Google","emoji":"💎","desc":"Gemini 2.0 Flash via your own key","thinking":False,"type":"chat","vision":True},
     "gm_pro": {"provider":"gemini","model":"gemini-2.5-pro","label":"Gemini 2.5 Pro","company":"Google","emoji":"💎","desc":"Gemini 2.5 Pro via your own key","thinking":True,"type":"chat","vision":True},
     "ds_chat": {"provider":"deepseek","model":"deepseek-chat","label":"DeepSeek Chat (Direct)","company":"DeepSeek","emoji":"🔵","desc":"DeepSeek V3 via your own key","thinking":False,"type":"chat"},
@@ -735,6 +747,11 @@ async def chat(request:Request):
     sys_parts=[f"You are Fusion.AI, an intelligent AI assistant built into an all-in-one AI platform. Today is {datetime.now().strftime('%A, %B %d, %Y')} and you're chatting with {u['username']}. PERSONALITY: Talk like a knowledgeable, thoughtful friend — warm, direct, never stiff. Use natural language; contractions are fine. Be concise on simple questions, go deep when warranted. Show genuine curiosity. Never start with 'Certainly!', 'Of course!', 'Great question!' or 'Absolutely!' — these are filler. Don't repeat the question back, just answer it. When you don't know something, say so plainly. FORMATTING: Use markdown (bold, code, headers, bullets) only when it genuinely helps. For math: $...$ inline, $$...$$ display block. For code: always complete runnable code — never placeholder comments. Keep responses tight — no padding, no 'In conclusion', no 'I hope this helps'. WEB SEARCH: When you get <web_context> tags, use that data and reference it naturally without saying 'According to my web search'. FILE GENERATION: When asked to make any file, wrap COMPLETE content EXACTLY as: <<<FUSIONFILE:filename.ext>>>\n[full content]\n<<<END_FUSIONFILE>>>. Types: .md .txt .csv .json .html .py .js .ts .css .sql .xml .yaml .sh .go .java .cpp .rb .php .toml .env .pptx.md .docx .xlsx. pptx.md: # Title per slide, --- between slides, 8+ slides. xlsx/docx: write CSV/markdown respectively (server converts to binary). ALWAYS complete — zero placeholders, zero truncation."]
 
     if mem: sys_parts.append("Remember about user:\n"+"\n".join(f"- {r['key']}: {r['value']}" for r in mem))
+    with db() as c:
+        active_skills=c.execute("SELECT name,instructions FROM skills WHERE user_id=? AND enabled=1",(u["id"],)).fetchall()
+    if active_skills:
+        skill_txt="\n\n".join(f"### Skill: {s['name']}\n{s['instructions']}" for s in active_skills)
+        sys_parts.append("The user has enabled the following custom skills — apply them whenever relevant to what they ask:\n"+skill_txt)
     sys_msg={"role":"system","content":" ".join(sys_parts)}
     base_msgs=[sys_msg]+history+[{"role":"user","content":full_msg}]
     with db() as c: c.execute("INSERT INTO messages(user_id,role,content,model,ts)VALUES(?,?,?,?,?)",(u["id"],"user",user_msg,MODELS[try_list[0]]["label"],_now()))
@@ -3369,6 +3386,8 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
     <div class="lsb-item" onclick="closeLSB();openSP('saved')"><span class="ei2">🔖</span> Saved Items</div>
     <div class="lsb-item" onclick="closeLSB();openSP('theme')"><span class="ei2">🎨</span> Theme</div>
     <div class="lsb-item" onclick="closeLSB();openSP('extra')"><span class="ei2">🔗</span> Custom Endpoint</div>
+    <div class="lsb-item" onclick="closeLSB();openSP('mcp')"><span class="ei2">🔌</span> MCP Servers</div>
+    <div class="lsb-item" onclick="closeLSB();openSP('skills')"><span class="ei2">🧩</span> Skills</div>
     <div class="lsb-item" onclick="closeLSB();openSP('scraper')"><span class="ei2">🦆</span> Web Search</div>
     <div class="lsb-item" onclick="closeLSB();openSP('tts')"><span class="ei2">🔊</span> Voice / TTS</div>
     <div class="lsb-item" onclick="closeLSB();openSP('voicechat')"><span class="ei2">🎤</span> Voice Chat</div>
@@ -3700,6 +3719,8 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
     <button class="sp-tab" onclick="switchSPTab('keys')" id="spt-keys"><span class="st-ico">⚙️</span><span class="st-lbl">Info</span></button>
     <button class="sp-tab" onclick="switchSPTab('scraper')" id="spt-scraper" title="Fusion.Browser"><span class="st-ico">🌐</span><span class="st-lbl">Browser</span></button>
     <button class="sp-tab" onclick="switchSPTab('extra')" id="spt-extra"><span class="st-ico">🔗</span><span class="st-lbl">Custom EP</span></button>
+    <button class="sp-tab" onclick="switchSPTab('mcp')" id="spt-mcp" title="MCP Servers"><span class="st-ico"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v4M15 2v4M6 8h12l-1 5a5 5 0 0 1-5 4h0a5 5 0 0 1-5-4L6 8z"/><path d="M12 17v3M9 22h6"/></svg></span><span class="st-lbl">MCP</span></button>
+    <button class="sp-tab" onclick="switchSPTab('skills')" id="spt-skills" title="Skills"><span class="st-ico"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h3.17a2 2 0 1 1 3.66 0H14a1 1 0 0 1 1 1v3.17a2 2 0 1 1 0 3.66V18a1 1 0 0 1-1 1h-3.17a2 2 0 1 0-3.66 0H4a1 1 0 0 1-1-1v-3.17a2 2 0 1 0 0-3.66V8a1 1 0 0 1 1-1z"/></svg></span><span class="st-lbl">Skills</span></button>
   </div>
   <div class="sp-body">
     <!-- INFO — clean user-facing panel, no API key details -->
@@ -3791,6 +3812,43 @@ header{box-shadow:0 1px 0 rgba(60,100,200,.2),0 8px 40px rgba(0,0,0,.6),0 0 80px
           <div style="display:flex;gap:6px">
             <input type="password" id="extraIn" placeholder="API key" autocomplete="off" style="flex:1;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:9px;padding:8px 10px;color:var(--tx);font-family:'DM Mono',monospace;font-size:11px;outline:none"/>
             <button class="ksave" onclick="saveKey('extra')">Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+<!-- MCP SERVERS -->
+    <div id="spTab-mcp" style="display:none">
+      <div class="sp-sec" style="margin-top:16px">
+        <h4>MCP Servers</h4>
+        <p style="font-size:10px;color:var(--tx3);margin:0 0 10px">Connect a Model Context Protocol server to give the assistant tools it can call. Each server is a URL implementing the MCP Streamable-HTTP transport.</p>
+        <div id="mcpServerList" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+        <div class="krow">
+          <div class="krow-top"><span class="kprov">Add Server</span></div>
+          <input type="text" id="mcpNewName" placeholder="Name (e.g. Asana)" autocomplete="off" style="width:100%;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:9px;padding:8px 10px;color:var(--tx);font-family:'DM Mono',monospace;font-size:11px;outline:none;margin-bottom:6px;box-sizing:border-box"/>
+          <input type="url" id="mcpNewUrl" placeholder="https://mcp.example.com/mcp" autocomplete="off" style="width:100%;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:9px;padding:8px 10px;color:var(--tx);font-family:'DM Mono',monospace;font-size:11px;outline:none;margin-bottom:6px;box-sizing:border-box"/>
+          <input type="text" id="mcpNewHeaders" placeholder='Extra headers, optional JSON e.g. {"Authorization":"Bearer xyz"}' autocomplete="off" style="width:100%;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:9px;padding:8px 10px;color:var(--tx);font-family:'DM Mono',monospace;font-size:11px;outline:none;margin-bottom:6px;box-sizing:border-box"/>
+          <button class="ksave" onclick="addMcpServer()">Add Server</button>
+        </div>
+      </div>
+    </div>
+<!-- SKILLS -->
+    <div id="spTab-skills" style="display:none">
+      <div class="sp-sec" style="margin-top:16px">
+        <h4>Skills</h4>
+        <p style="font-size:10px;color:var(--tx3);margin:0 0 10px">Reusable instruction bundles. Turn one on and its instructions get folded into every chat until you turn it off again.</p>
+        <div id="skillList" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+        <div class="krow">
+          <div class="krow-top"><span class="kprov" id="skillFormTitle">New Skill</span></div>
+          <input type="hidden" id="skillEditId" value=""/>
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input type="text" id="skillIcon" placeholder="Icon" maxlength="4" value="🧩" style="width:52px;text-align:center;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:9px;padding:8px 6px;color:var(--tx);font-size:15px;outline:none"/>
+            <input type="text" id="skillName" placeholder="Skill name" autocomplete="off" style="flex:1;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:9px;padding:8px 10px;color:var(--tx);font-family:'DM Mono',monospace;font-size:11px;outline:none"/>
+          </div>
+          <input type="text" id="skillDesc" placeholder="Short description (optional)" autocomplete="off" style="width:100%;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:9px;padding:8px 10px;color:var(--tx);font-family:'DM Mono',monospace;font-size:11px;outline:none;margin-bottom:6px;box-sizing:border-box"/>
+          <textarea id="skillInstructions" placeholder="Instructions the model should follow whenever this skill is on…" rows="4" style="width:100%;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:9px;padding:8px 10px;color:var(--tx);font-family:'DM Mono',monospace;font-size:11px;outline:none;margin-bottom:6px;box-sizing:border-box;resize:vertical"></textarea>
+          <div style="display:flex;gap:6px">
+            <button class="ksave" onclick="saveSkillForm()" id="skillFormBtn">Create Skill</button>
+            <button class="ksave" style="background:transparent;border:1.5px solid var(--glass-bdr)" onclick="resetSkillForm()" id="skillFormCancelBtn" hidden>Cancel</button>
           </div>
         </div>
       </div>
@@ -5084,6 +5142,7 @@ async function loadModels() {
   try{
     var r=await apiFetch('/api/models'); var d=await r.json(); allModels=(d.models||[]).filter(function(m){return !m.disabled;});
     var sel=document.getElementById('mOverride');
+    var _prevVal=sel?sel.value:null;
     var byGroup={};
     allModels.forEach(function(m){
       var grp;
@@ -5102,6 +5161,11 @@ async function loadModels() {
       ms.forEach(function(m){var o=document.createElement('option');o.value=m.key;var sc=m.score?(' ['+Math.round(m.score*100)+']'):'';var tg=(m.thinking?' \uD83E\uDDE0':'')+((m.vision||m.provider==='image_or')?' \uD83D\uDDBC\uFE0F':'');o.textContent=m.label+tg+sc+' \u2014 '+m.desc;if(m.key===currentMKey)o.selected=true;og.appendChild(o);});
       sel.appendChild(og);
     });
+    // Re-attach the custom-endpoint option — loadModels() rebuilds sel.innerHTML from
+    // scratch on every call (initial load, dev-panel model toggles, etc.), which used to
+    // silently wipe out the custom endpoint entry added by saveCustomEndpoint(). Restoring
+    // it here, synchronously, right after the rebuild, removes that race entirely.
+    if(_customEndpointData && _customEndpointData.url) _addCustomModelOption(_customEndpointData.url,_customEndpointData.model);
     if(currentMKey!=='auto') sel.value=currentMKey;updateModelModeUI(currentMKey);
   }catch(e){}
 }
@@ -5528,7 +5592,7 @@ async function addMemory(){
 }
 async function delMemory(enc){var key=decodeURIComponent(enc);await apiFetch('/api/memory/'+encodeURIComponent(key),{method:'DELETE'});loadMemory();showToast('Memory removed');}
 
-var SP_TABS =['keys','model','imagine','video','threed','audio','voicechat','tts','convs','saved','memory','theme','scraper','extra'];
+var SP_TABS =['keys','model','imagine','video','threed','audio','voicechat','tts','convs','saved','memory','theme','scraper','extra','mcp','skills'];
 _initAvatar();
 function openSP(tab){document.getElementById('sp').classList.add('open');document.getElementById('ovl').classList.add('open');closeDrop();switchSPTab(tab||'model');}
 function closeSP(){document.getElementById('sp').classList.remove('open');document.getElementById('ovl').classList.remove('open');}
@@ -5547,6 +5611,8 @@ function switchSPTab(t){
   if(t==='tts'||t==='voicechat'){loadVoices();loadVCVoices();}
   if(t==='theme') updateThemeUI();if(t==='threed') update3DUI();
   if(t==='extra') _loadCustomEndpointUI();
+  if(t==='mcp') loadMcpServers();
+  if(t==='skills') loadSkills();
 }
 
 function update3DUI(){
@@ -7493,6 +7559,164 @@ function _loadCustomEndpointUI(){
   if(d.url)_addCustomModelOption(d.url,d.model);
 }
 
+// ── MCP Servers ──────────────────────────────────────────────────────────
+var _mcpServers = [];
+var _mcpToolsCache = {};
+var ICO_TRASH='<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/></svg>';
+var ICO_PLUG='<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v4M15 2v4M6 8h12l-1 5a5 5 0 0 1-5 4h0a5 5 0 0 1-5-4L6 8z"/><path d="M12 17v3M9 22h6"/></svg>';
+async function loadMcpServers(){
+  try{
+    var r=await apiFetch('/api/mcp/servers'); var d=await r.json();
+    _mcpServers=d.servers||[]; renderMcpServerList();
+  }catch(e){}
+}
+function renderMcpServerList(){
+  var box=document.getElementById('mcpServerList'); if(!box) return;
+  if(!_mcpServers.length){ box.innerHTML='<div style="font-size:11px;color:var(--tx3);padding:6px 2px">No MCP servers yet — add one below.</div>'; return; }
+  box.innerHTML=_mcpServers.map(function(s){
+    var statusColor=s.last_status==='ok'?'#7ee8a2':(s.last_status?'#ff8484':'var(--tx3)');
+    var statusTxt=s.last_status==='ok'?'Connected':(s.last_status?'Error':'Not tested');
+    var tools=_mcpToolsCache[s.id];
+    var toolsHtml='';
+    if(tools){
+      toolsHtml='<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">'+tools.map(function(t){
+        var tid='mcpArgs_'+s.id+'_'+t.name.replace(/[^a-zA-Z0-9]/g,'_');
+        return '<div style="background:rgba(255,255,255,.03);border-radius:8px;padding:8px">'
+          +'<div style="font-size:11px;font-weight:600;color:var(--tx)">'+escHtml(t.name)+'</div>'
+          +'<div style="font-size:10px;color:var(--tx3);margin:2px 0 6px">'+escHtml(t.description||'')+'</div>'
+          +'<div style="display:flex;gap:6px">'
+          +'<input type="text" id="'+tid+'" placeholder=\'arguments as JSON, e.g. {"text":"hi"}\' style="flex:1;background:var(--inp);border:1.5px solid var(--glass-bdr);border-radius:7px;padding:6px 8px;color:var(--tx);font-family:\'DM Mono\',monospace;font-size:10px;outline:none"/>'
+          +'<button class="ksave" style="padding:6px 10px;font-size:10px" onclick="invokeMcpTool('+s.id+',\''+t.name.replace(/'/g,"\\'")+'\',\''+tid+'\')">Run</button>'
+          +'</div><div id="'+tid+'_out" style="font-size:10px;color:var(--tx2);margin-top:6px;white-space:pre-wrap;font-family:\'DM Mono\',monospace"></div>'
+          +'</div>';
+      }).join('')+'</div>';
+    }
+    return '<div class="krow">'
+      +'<div class="krow-top"><span class="kprov">'+ICO_PLUG+' '+escHtml(s.name)+'</span><span class="kstat" style="color:'+statusColor+'">'+statusTxt+'</span></div>'
+      +'<div style="font-size:10px;color:var(--tx3);font-family:\'DM Mono\',monospace;word-break:break-all;margin-bottom:8px">'+escHtml(s.url)+'</div>'
+      +'<div style="display:flex;gap:6px;flex-wrap:wrap">'
+      +'<button class="ksave" style="padding:6px 10px;font-size:10px" onclick="testMcpTools('+s.id+')">List Tools</button>'
+      +'<button class="ksave" style="padding:6px 10px;font-size:10px;background:transparent;border:1.5px solid var(--glass-bdr)" onclick="toggleMcpServer('+s.id+','+(s.enabled?'false':'true')+')">'+(s.enabled?'Disable':'Enable')+'</button>'
+      +'<button class="ksave" style="padding:6px 10px;font-size:10px;background:transparent;border:1.5px solid var(--glass-bdr)" onclick="deleteMcpServer('+s.id+')">'+ICO_TRASH+' Delete</button>'
+      +'</div>'+toolsHtml
+      +'</div>';
+  }).join('');
+}
+async function addMcpServer(){
+  var name=(document.getElementById('mcpNewName')||{}).value.trim();
+  var url=(document.getElementById('mcpNewUrl')||{}).value.trim();
+  var hdrRaw=(document.getElementById('mcpNewHeaders')||{}).value.trim();
+  if(!name||!url){ showToast('Name and URL required'); return; }
+  var headers={};
+  if(hdrRaw){ try{ headers=JSON.parse(hdrRaw); }catch(e){ showToast('Headers must be valid JSON'); return; } }
+  try{
+    var r=await apiFetch('/api/mcp/servers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,url:url,headers:headers})});
+    var d=await r.json();
+    if(!r.ok){ showToast('Error: '+(d.error||'could not add server')); return; }
+    document.getElementById('mcpNewName').value='';document.getElementById('mcpNewUrl').value='';document.getElementById('mcpNewHeaders').value='';
+    showToast('MCP server added'); loadMcpServers();
+  }catch(e){ showToast('Network error'); }
+}
+async function deleteMcpServer(id){
+  if(!confirm('Remove this MCP server?')) return;
+  await apiFetch('/api/mcp/servers/'+id+'/delete',{method:'POST'});
+  delete _mcpToolsCache[id]; showToast('Server removed'); loadMcpServers();
+}
+async function toggleMcpServer(id,en){
+  await apiFetch('/api/mcp/servers/'+id+'/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:en})});
+  loadMcpServers();
+}
+async function testMcpTools(id){
+  showToast('Connecting…');
+  try{
+    var r=await apiFetch('/api/mcp/servers/'+id+'/tools',{method:'POST'});
+    var d=await r.json();
+    if(!r.ok){ showToast('Error: '+(d.error||'connection failed')); loadMcpServers(); return; }
+    _mcpToolsCache[id]=d.tools||[];
+    showToast((d.tools||[]).length+' tool(s) found');
+    loadMcpServers();
+  }catch(e){ showToast('Network error'); }
+}
+async function invokeMcpTool(id,toolName,inputId){
+  var raw=(document.getElementById(inputId)||{}).value.trim();
+  var args={};
+  if(raw){ try{ args=JSON.parse(raw); }catch(e){ showToast('Arguments must be valid JSON'); return; } }
+  var out=document.getElementById(inputId+'_out'); if(out) out.textContent='Running…';
+  try{
+    var r=await apiFetch('/api/mcp/servers/'+id+'/call',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tool:toolName,arguments:args})});
+    var d=await r.json();
+    if(out) out.textContent=r.ok?JSON.stringify(d.result,null,2):('Error: '+(d.error||'call failed'));
+  }catch(e){ if(out) out.textContent='Network error'; }
+}
+
+// ── Skills ───────────────────────────────────────────────────────────────
+var _skills = [];
+async function loadSkills(){
+  try{
+    var r=await apiFetch('/api/skills'); var d=await r.json();
+    _skills=d.skills||[]; renderSkillList();
+  }catch(e){}
+}
+function renderSkillList(){
+  var box=document.getElementById('skillList'); if(!box) return;
+  if(!_skills.length){ box.innerHTML='<div style="font-size:11px;color:var(--tx3);padding:6px 2px">No skills yet — create one below.</div>'; return; }
+  box.innerHTML=_skills.map(function(s){
+    return '<div class="krow">'
+      +'<div class="krow-top"><span class="kprov">'+(s.icon||'🧩')+' '+escHtml(s.name)+'</span><span class="kstat '+(s.enabled?'set':'unset')+'">'+(s.enabled?'On':'Off')+'</span></div>'
+      +(s.description?'<div style="font-size:10px;color:var(--tx3);margin-bottom:8px">'+escHtml(s.description)+'</div>':'')
+      +'<div style="display:flex;gap:6px;flex-wrap:wrap">'
+      +'<button class="ksave" style="padding:6px 10px;font-size:10px" onclick="toggleSkill('+s.id+','+(s.enabled?'false':'true')+')">'+(s.enabled?'Turn Off':'Turn On')+'</button>'
+      +'<button class="ksave" style="padding:6px 10px;font-size:10px;background:transparent;border:1.5px solid var(--glass-bdr)" onclick="editSkill('+s.id+')">Edit</button>'
+      +'<button class="ksave" style="padding:6px 10px;font-size:10px;background:transparent;border:1.5px solid var(--glass-bdr)" onclick="deleteSkillUI('+s.id+')">'+ICO_TRASH+' Delete</button>'
+      +'</div></div>';
+  }).join('');
+}
+function editSkill(id){
+  var s=_skills.find(function(x){return x.id===id;}); if(!s) return;
+  document.getElementById('skillEditId').value=id;
+  document.getElementById('skillIcon').value=s.icon||'🧩';
+  document.getElementById('skillName').value=s.name||'';
+  document.getElementById('skillDesc').value=s.description||'';
+  document.getElementById('skillInstructions').value=s.instructions||'';
+  document.getElementById('skillFormTitle').textContent='Edit Skill';
+  document.getElementById('skillFormBtn').textContent='Save Changes';
+  document.getElementById('skillFormCancelBtn').hidden=false;
+}
+function resetSkillForm(){
+  document.getElementById('skillEditId').value='';
+  document.getElementById('skillIcon').value='🧩';
+  document.getElementById('skillName').value='';
+  document.getElementById('skillDesc').value='';
+  document.getElementById('skillInstructions').value='';
+  document.getElementById('skillFormTitle').textContent='New Skill';
+  document.getElementById('skillFormBtn').textContent='Create Skill';
+  document.getElementById('skillFormCancelBtn').hidden=true;
+}
+async function saveSkillForm(){
+  var id=(document.getElementById('skillEditId')||{}).value;
+  var icon=(document.getElementById('skillIcon')||{}).value.trim()||'🧩';
+  var name=(document.getElementById('skillName')||{}).value.trim();
+  var description=(document.getElementById('skillDesc')||{}).value.trim();
+  var instructions=(document.getElementById('skillInstructions')||{}).value.trim();
+  if(!name||!instructions){ showToast('Name and instructions required'); return; }
+  try{
+    var url=id?('/api/skills/'+id+'/update'):'/api/skills';
+    var r=await apiFetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,icon:icon,description:description,instructions:instructions})});
+    var d=await r.json();
+    if(!r.ok){ showToast('Error: '+(d.error||'could not save')); return; }
+    showToast(id?'Skill updated':'Skill created'); resetSkillForm(); loadSkills();
+  }catch(e){ showToast('Network error'); }
+}
+async function deleteSkillUI(id){
+  if(!confirm('Delete this skill?')) return;
+  await apiFetch('/api/skills/'+id+'/delete',{method:'POST'});
+  showToast('Skill deleted'); loadSkills();
+}
+async function toggleSkill(id,en){
+  await apiFetch('/api/skills/'+id+'/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:en})});
+  loadSkills();
+}
+
 // ── Scraper JS ─────────────────────────────────────────────────────────────
 var _scraperData = null;
 async function doScrape(){
@@ -8401,30 +8625,37 @@ document.addEventListener('keydown',function(e){
 /* ═══ FusionOS desktop ══════════════════════════════════════════════════════ */
 #fos-overlay{position:fixed;inset:0;z-index:9500;display:none;flex-direction:column;background:#050710;font-family:'Segoe UI',system-ui,sans-serif}
 #fos-overlay.fos-on{display:flex}
-#fos-bar{height:26px;background:rgba(6,8,18,.96);backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,255,255,.055);display:flex;align-items:center;padding:0 10px;gap:0;flex-shrink:0;user-select:none}
-.fosb-logo{font-size:12px;font-weight:800;background:linear-gradient(120deg,#4a9eff,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-right:14px;cursor:pointer;letter-spacing:.3px}
-.fosb-item{font-size:11px;color:rgba(255,255,255,.65);padding:2px 9px;border-radius:5px;cursor:pointer;transition:background .1s}
-.fosb-item:hover{background:rgba(255,255,255,.1);color:#fff}
-.fosb-right{margin-left:auto;display:flex;align-items:center;gap:12px}
-.fosb-clock{font-size:11px;color:rgba(255,255,255,.45);font-variant-numeric:tabular-nums}
 #fos-desktop{flex:1;position:relative;overflow:hidden;background:radial-gradient(ellipse at 28% 22%,#0c1840 0%,#04060f 60%,#000 100%)}
 #fos-desktop::before{content:'';position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.025) 1px,transparent 1px);background-size:28px 28px;pointer-events:none}
-#fos-dock{height:62px;background:rgba(6,8,18,.9);backdrop-filter:blur(28px);border-top:1px solid rgba(255,255,255,.055);display:flex;align-items:center;justify-content:center;gap:4px;padding:0 16px;flex-shrink:0}
-.fos-dck{display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;padding:5px 9px;border-radius:11px;transition:all .15s;border:none;background:none;position:relative}
-.fos-dck:hover{background:rgba(255,255,255,.08);transform:translateY(-4px)}
-.fos-dck-ico{font-size:24px;transition:transform .15s}
-.fos-dck:hover .fos-dck-ico{transform:scale(1.18)}
-.fos-dck-lbl{font-size:9px;color:rgba(255,255,255,.4);white-space:nowrap}
-.fos-dck-dot{position:absolute;bottom:2px;left:50%;transform:translateX(-50%);width:4px;height:4px;border-radius:50%;background:#4a9eff;display:none}
+/* Windows 11-style taskbar: Start button | centered pinned apps | system tray */
+#fos-dock{height:48px;background:rgba(6,8,18,.82);backdrop-filter:blur(28px);border-top:1px solid rgba(255,255,255,.07);display:flex;align-items:center;gap:2px;padding:0 8px;flex-shrink:0;position:relative}
+.fos-tb-start{display:flex;align-items:center;gap:6px;padding:0 12px;height:38px;border-radius:8px;background:none;border:none;cursor:pointer;transition:background .12s;flex-shrink:0}
+.fos-tb-start:hover,.fos-tb-start.fos-start-open{background:rgba(255,255,255,.08)}
+.fos-tb-icons{flex:1;display:flex;align-items:center;justify-content:center;gap:2px;min-width:0;overflow-x:auto;scrollbar-width:none}
+.fos-tb-icons::-webkit-scrollbar{display:none}
+.fos-tb-tray{display:flex;align-items:center;gap:10px;padding:0 10px;flex-shrink:0}
+.fos-dck{display:flex;align-items:center;justify-content:center;cursor:pointer;width:40px;height:38px;border-radius:8px;transition:background .12s;border:none;background:none;position:relative;flex-shrink:0}
+.fos-dck:hover{background:rgba(255,255,255,.08)}
+.fos-dck-ico{font-size:19px;line-height:1}
+.fos-dck-lbl{display:none}
+.fos-dck-dot{position:absolute;bottom:2px;left:50%;transform:translateX(-50%);width:5px;height:3px;border-radius:2px;background:#4a9eff;display:none}
 .fos-dck.fos-running .fos-dck-dot{display:block}
+.fos-start-menu{position:absolute;left:8px;bottom:56px;width:260px;background:rgba(14,17,30,.97);backdrop-filter:blur(30px);border:1px solid rgba(255,255,255,.09);border-radius:12px;box-shadow:0 20px 55px rgba(0,0,0,.85);padding:10px;display:none;flex-direction:column;gap:2px;z-index:20}
+.fos-start-menu.fos-open{display:flex}
+.fos-start-menu-item{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;cursor:pointer;color:rgba(255,255,255,.85);font-size:12.5px;transition:background .12s}
+.fos-start-menu-item:hover{background:rgba(255,255,255,.08)}
+.fos-start-menu-sep{height:1px;background:rgba(255,255,255,.08);margin:6px 2px}
 /* Windows */
-.fos-win{position:absolute;background:rgba(10,14,26,.97);border:1px solid rgba(255,255,255,.09);border-radius:12px;box-shadow:0 20px 55px rgba(0,0,0,.85);display:flex;flex-direction:column;overflow:hidden;min-width:280px;min-height:180px;animation:fosIn .16s ease-out}
+.fos-win{position:absolute;background:rgba(10,14,26,.97);border:1px solid rgba(255,255,255,.09);border-radius:8px;box-shadow:0 20px 55px rgba(0,0,0,.85);display:flex;flex-direction:column;overflow:hidden;min-width:280px;min-height:180px;animation:fosIn .16s ease-out}
 @keyframes fosIn{from{opacity:0;transform:scale(.95) translateY(6px)}to{opacity:1;transform:none}}
 .fos-win.fos-focused{border-color:rgba(74,158,255,.25);box-shadow:0 24px 70px rgba(0,0,0,.9),0 0 0 1px rgba(74,158,255,.1)}
 .fos-win.fos-mini{display:none}
-.fos-titlebar{height:34px;background:rgba(12,16,30,.99);display:flex;align-items:center;padding:0 11px;gap:8px;cursor:move;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.046);user-select:none}
-.fos-traf{display:flex;gap:5px}.fos-tb{width:11px;height:11px;border-radius:50%;border:none;cursor:pointer;flex-shrink:0;outline:none;transition:filter .1s}.fos-tb:hover{filter:brightness(1.5)}
-.fos-tbc{background:#ff5f56}.fos-tbm{background:#ffbd2e}.fos-tbx{background:#27c93f}
+.fos-titlebar{height:34px;background:rgba(12,16,30,.99);display:flex;align-items:center;padding:0 0 0 11px;gap:8px;cursor:move;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.046);user-select:none}
+.fos-traf{display:flex;margin-left:auto;height:100%}
+.fos-tb{width:44px;height:100%;border-radius:0;border:none;cursor:pointer;flex-shrink:0;outline:none;background:none;display:flex;align-items:center;justify-content:center;transition:background .1s;color:rgba(255,255,255,.7)}
+.fos-tb:hover{background:rgba(255,255,255,.09)}
+.fos-tb svg{width:10px;height:10px}
+.fos-tbc:hover{background:#e81123;color:#fff}
 .fos-wico{font-size:13px;flex-shrink:0}.fos-wtitle{font-size:11.5px;color:rgba(255,255,255,.68);font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .fos-body{flex:1;overflow:hidden;display:flex;flex-direction:column;position:relative}
 /* Resize handles */
@@ -8494,28 +8725,34 @@ document.addEventListener('keydown',function(e){
 
 <!-- ═════════ FusionOS overlay ═══════════════════════════════════════════ -->
 <div id="fos-overlay">
-  <div id="fos-bar">
-    <div class="fosb-logo" onclick="closeFusionOS()">⬛ FusionOS</div>
-    <div class="fosb-item" onclick="fosOpen('terminal')">Terminal</div>
-    <div class="fosb-item" onclick="fosOpen('files')">Files</div>
-    <div class="fosb-item" onclick="fosOpen('editor')">Editor</div>
-    <div class="fosb-item" onclick="fosOpen('agent')">Agent</div>
-    <div class="fosb-item" onclick="fosOpen('browser')">Browser</div>
-    <div class="fosb-item" onclick="fosOpen('monitor')">Monitor</div>
-    <div class="fosb-right">
+  <div id="fos-desktop"></div>
+  <div class="fos-start-menu" id="fos-start-menu">
+    <div class="fos-start-menu-item" onclick="fosOpen('terminal');fosToggleStart(false)"><span class="fos-dck-ico">🖳</span> Terminal</div>
+    <div class="fos-start-menu-item" onclick="fosOpen('files');fosToggleStart(false)"><span class="fos-dck-ico">🗂</span> File Explorer</div>
+    <div class="fos-start-menu-item" onclick="fosOpen('editor');fosToggleStart(false)"><span class="fos-dck-ico">📝</span> Editor</div>
+    <div class="fos-start-menu-item" onclick="fosOpen('agent');fosToggleStart(false)"><span class="fos-dck-ico">🤖</span> Agent</div>
+    <div class="fos-start-menu-item" onclick="fosOpen('browser');fosToggleStart(false)"><span class="fos-dck-ico">🌐</span> Browser</div>
+    <div class="fos-start-menu-item" onclick="fosOpen('monitor');fosToggleStart(false)"><span class="fos-dck-ico">📊</span> Task Manager</div>
+    <div class="fos-start-menu-sep"></div>
+    <div class="fos-start-menu-item" onclick="closeFusionOS()" style="color:#ff8484">Exit FusionOS</div>
+  </div>
+  <div id="fos-dock">
+    <button class="fos-tb-start" id="fos-start-btn" onclick="fosToggleStart()" title="Start">
+      <svg viewBox="0 0 24 24" width="16" height="16"><rect x="2" y="2" width="9" height="9" fill="#4a9eff"/><rect x="13" y="2" width="9" height="9" fill="#a855f7"/><rect x="2" y="13" width="9" height="9" fill="#a855f7"/><rect x="13" y="13" width="9" height="9" fill="#4a9eff"/></svg>
+    </button>
+    <div class="fos-tb-icons">
+      <button class="fos-dck" data-app="terminal" onclick="fosOpen('terminal')" title="Terminal"><span class="fos-dck-ico">🖳</span><span class="fos-dck-lbl">Terminal</span><span class="fos-dck-dot"></span></button>
+      <button class="fos-dck" data-app="files" onclick="fosOpen('files')" title="File Explorer"><span class="fos-dck-ico">🗂</span><span class="fos-dck-lbl">Files</span><span class="fos-dck-dot"></span></button>
+      <button class="fos-dck" data-app="editor" onclick="fosOpen('editor')" title="Editor"><span class="fos-dck-ico">📝</span><span class="fos-dck-lbl">Editor</span><span class="fos-dck-dot"></span></button>
+      <button class="fos-dck" data-app="agent" onclick="fosOpen('agent')" title="Agent"><span class="fos-dck-ico">🤖</span><span class="fos-dck-lbl">Agent</span><span class="fos-dck-dot"></span></button>
+      <button class="fos-dck" data-app="browser" onclick="fosOpen('browser')" title="Browser"><span class="fos-dck-ico">🌐</span><span class="fos-dck-lbl">Browser</span><span class="fos-dck-dot"></span></button>
+      <button class="fos-dck" data-app="monitor" onclick="fosOpen('monitor')" title="Task Manager"><span class="fos-dck-ico">📊</span><span class="fos-dck-lbl">Monitor</span><span class="fos-dck-dot"></span></button>
+    </div>
+    <div class="fos-tb-tray">
       <span style="font-size:9px;background:rgba(45,164,78,.18);border:1px solid rgba(45,164,78,.35);border-radius:10px;padding:2px 8px;color:#6ee77a">LIVE SANDBOX</span>
       <span class="fosb-clock" id="fos-clock">00:00</span>
-      <button class="fosb-item" onclick="closeFusionOS()" style="border:none;background:none;color:rgba(255,255,255,.5);cursor:pointer">✕ Exit</button>
+      <button onclick="closeFusionOS()" title="Exit FusionOS" style="border:none;background:none;color:rgba(255,255,255,.55);cursor:pointer;font-size:14px;padding:4px 6px;border-radius:6px" onmouseover="this.style.background='rgba(232,17,35,.85)';this.style.color='#fff'" onmouseout="this.style.background='none';this.style.color='rgba(255,255,255,.55)'">✕</button>
     </div>
-  </div>
-  <div id="fos-desktop"></div>
-  <div id="fos-dock">
-    <button class="fos-dck" data-app="terminal" onclick="fosOpen('terminal')"><span class="fos-dck-ico">🖳</span><span class="fos-dck-lbl">Terminal</span><span class="fos-dck-dot"></span></button>
-    <button class="fos-dck" data-app="files" onclick="fosOpen('files')"><span class="fos-dck-ico">🗂</span><span class="fos-dck-lbl">Files</span><span class="fos-dck-dot"></span></button>
-    <button class="fos-dck" data-app="editor" onclick="fosOpen('editor')"><span class="fos-dck-ico">📝</span><span class="fos-dck-lbl">Editor</span><span class="fos-dck-dot"></span></button>
-    <button class="fos-dck" data-app="agent" onclick="fosOpen('agent')"><span class="fos-dck-ico">🤖</span><span class="fos-dck-lbl">Agent</span><span class="fos-dck-dot"></span></button>
-    <button class="fos-dck" data-app="browser" onclick="fosOpen('browser')"><span class="fos-dck-ico">🌐</span><span class="fos-dck-lbl">Browser</span><span class="fos-dck-dot"></span></button>
-    <button class="fos-dck" data-app="monitor" onclick="fosOpen('monitor')"><span class="fos-dck-ico">📊</span><span class="fos-dck-lbl">Monitor</span><span class="fos-dck-dot"></span></button>
   </div>
 </div>
 
@@ -8608,6 +8845,18 @@ function openFusionOS(){
 }
 function closeFusionOS(){ document.getElementById('fos-overlay').classList.remove('fos-on'); }
 function _fosTick(){ var el=document.getElementById('fos-clock'); if(el){ var d=new Date(); el.textContent=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); } }
+function fosToggleStart(force){
+  var menu=document.getElementById('fos-start-menu'); var btn=document.getElementById('fos-start-btn');
+  if(!menu) return;
+  var open=(typeof force==='boolean')?force:!menu.classList.contains('fos-open');
+  menu.classList.toggle('fos-open',open); if(btn) btn.classList.toggle('fos-start-open',open);
+}
+document.addEventListener('click',function(e){
+  var menu=document.getElementById('fos-start-menu'); var btn=document.getElementById('fos-start-btn');
+  if(!menu||!menu.classList.contains('fos-open')) return;
+  if(menu.contains(e.target)||(btn&&btn.contains(e.target))) return;
+  fosToggleStart(false);
+});
 
 function fosOpen(app,opts){
   opts=opts||{};
@@ -8623,7 +8872,7 @@ function fosOpen(app,opts){
   var win=document.createElement('div'); win.className='fos-win'; win.id=id;
   win.style.cssText='left:'+x+'px;top:'+y+'px;width:'+cfg.w+'px;height:'+cfg.h+'px;z-index:'+(++_fos.zTop);
   win.innerHTML='<div class="fos-titlebar">'
-    +'<div class="fos-traf"><button class="fos-tb fos-tbc" onclick="fosClose(\''+id+'\')"></button><button class="fos-tb fos-tbm" onclick="fosMini(\''+id+'\')"></button><button class="fos-tb fos-tbx" onclick="fosMax(\''+id+'\')"></button></div>'
+    +'<div class="fos-traf"><button class="fos-tb fos-tbn" onclick="fosMini(\''+id+'\')" title="Minimize"><svg viewBox="0 0 10 10"><line x1="0" y1="9" x2="10" y2="9" stroke="currentColor" stroke-width="1.2"/></svg></button><button class="fos-tb fos-tbx" onclick="fosMax(\''+id+'\')" title="Maximize"><svg viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></button><button class="fos-tb fos-tbc" onclick="fosClose(\''+id+'\')" title="Close"><svg viewBox="0 0 10 10"><line x1="0" y1="0" x2="10" y2="10" stroke="currentColor" stroke-width="1.2"/><line x1="10" y1="0" x2="0" y2="10" stroke="currentColor" stroke-width="1.2"/></svg></button></div>'
     +'<span class="fos-wico">'+cfg.ico+'</span><span class="fos-wtitle">'+(opts.title||cfg.title)+'</span></div>'
     +'<div class="fos-body" id="'+id+'-b"></div>'
     +'<div class="fos-rz fos-rz-n" data-d="n"></div><div class="fos-rz fos-rz-s" data-d="s"></div>'
@@ -8676,7 +8925,7 @@ function _fosFmt(b){ if(b<1024)return b+'B'; if(b<1048576)return (b/1024).toFixe
 
 // ── Terminal ─────────────────────────────────────────────────────────────────
 function _fosTerminal(body,id){
-  body.innerHTML='<div class="fos-term"><div class="fos-term-out" id="'+id+'-o"><span class="fos-dim">FusionOS Terminal — real Linux shell. Type help for tips.\n\n</span></div><div class="fos-term-row"><span class="fos-prompt" id="'+id+'-pr">~ $</span><input class="fos-inp" id="'+id+'-i" autocomplete="off" spellcheck="false" placeholder="type a command…"/></div></div>';
+  body.innerHTML='<div class="fos-term"><div class="fos-term-out" id="'+id+'-o"><span class="fos-dim">Windows PowerShell — FusionOS [Version 11.0.26100]\nRuns real commands against the host shell; dir/type/copy/move/del/cls are aliased for you.\n\n</span></div><div class="fos-term-row"><span class="fos-prompt" id="'+id+'-pr">PS C:\\Users\\FusionAI&gt;</span><input class="fos-inp" id="'+id+'-i" autocomplete="off" spellcheck="false" placeholder="type a command…"/></div></div>';
   var inp=document.getElementById(id+'-i'); var hist=[],hi=0;
   inp.addEventListener('keydown',async function(e){
     if(e.key==='Enter'){ var cmd=inp.value; inp.value=''; if(!cmd.trim())return; hist.push(cmd); hi=hist.length; await _fosRunCmd(id,cmd); }
@@ -8688,9 +8937,10 @@ function _fosTerminal(body,id){
 async function _fosRunCmd(id,cmd){
   var out=document.getElementById(id+'-o'); if(!out)return;
   var pr=document.getElementById(id+'-pr');
-  var cwd=(pr.textContent.split(' $')[0]||'~').replace(/^~\//,'').replace(/^~$/,'');
-  if(cmd.trim()==='help'){ out.innerHTML+='<span class="fos-cmd-echo">$ help</span>\n<span class="fos-dim">Commands: any bash, python3, node, curl, git, gcc, npm, pip\nSpecials: clear, cd, help\nFor multi-step tasks use the Agent app.</span>\n\n'; out.scrollTop=out.scrollHeight; return; }
-  out.innerHTML+='<span class="fos-cmd-echo">$ '+escHtml(cmd)+'</span>\n';
+  var promptBase='PS C:\\Users\\FusionAI';
+  var cwd=pr.textContent.slice(promptBase.length,-1).replace(/^\\/,'').replace(/\\/g,'/');
+  if(cmd.trim()==='help'){ out.innerHTML+='<span class="fos-cmd-echo">&gt; help</span>\n<span class="fos-dim">Commands: any bash, python3, node, curl, git, gcc, npm, pip\nWindows-style aliases: dir, type, copy, move, del, cls, findstr, where\nSpecials: clear/cls, cd, ver, help\nFor multi-step tasks use the Agent app.</span>\n\n'; out.scrollTop=out.scrollHeight; return; }
+  out.innerHTML+='<span class="fos-cmd-echo">&gt; '+escHtml(cmd)+'</span>\n';
   out.scrollTop=out.scrollHeight;
   try{
     var d=await _fosPost('/api/fos/exec',{cmd:cmd,cwd:cwd});
@@ -8698,7 +8948,7 @@ async function _fosRunCmd(id,cmd){
     if(d.stdout) out.innerHTML+='<span class="fos-ok-txt">'+escHtml(d.stdout)+(d.stdout.endsWith('\n')?'':'\n')+'</span>';
     if(d.stderr) out.innerHTML+='<span class="fos-err-txt">'+escHtml(d.stderr)+(d.stderr.endsWith('\n')?'':'\n')+'</span>';
     if(!d.stdout&&!d.stderr) out.innerHTML+='\n';
-    pr.textContent='~'+(d.cwd?'/'+d.cwd:'')+' $';
+    pr.textContent=promptBase+(d.cwd?'\\'+d.cwd.replace(/\//g,'\\'):'')+'>';
   }catch(e){ out.innerHTML+='<span class="fos-err-txt">Error: '+escHtml(e.message)+'</span>\n'; }
   out.innerHTML+='\n'; out.scrollTop=out.scrollHeight;
 }
@@ -9721,6 +9971,24 @@ def _fos_blocked(cmd):
         if b in low: return b
     return None
 
+def _fos_win_alias(cmd):
+    """Translate common Windows cmd/PowerShell commands to their POSIX equivalents so a user
+    typing what they'd type in a real Windows terminal gets something that actually works
+    against the real Linux shell underneath. Only rewrites the leading command word — anything
+    after it (flags, paths) is passed through untouched. Not a full shim, just the common ones."""
+    parts = cmd.strip().split(None, 1)
+    if not parts: return cmd
+    head, rest = parts[0].lower(), (parts[1] if len(parts) > 1 else "")
+    ALIAS = {
+        "dir": "ls -la", "type": "cat", "copy": "cp", "move": "mv",
+        "del": "rm", "erase": "rm", "rd": "rmdir", "md": "mkdir",
+        "cat.exe": "cat", "findstr": "grep", "where": "which",
+        "cls": "clear", "ipconfig": "hostname -I",
+    }
+    if head in ALIAS:
+        return (ALIAS[head] + " " + rest).strip()
+    return cmd
+
 def _fos_run(cmd, cwd, timeout=30):
     env = os.environ.copy(); env["HOME"] = cwd; env["TERM"] = "xterm-256color"
     try:
@@ -9733,32 +10001,26 @@ def _fos_run(cmd, cwd, timeout=30):
         return "", str(ex), 1
 
 # ── Real headless Chromium — used by the FusionOS Browser app ────────────────
-_CHROMIUM_BIN_CACHE = {"path": None, "checked": False, "install_tried": False}
+# NOTE ON RENDER: a runtime `apt-get install` (the old approach) cannot work on Render's
+# native Python runtime — the process has no root and no apt access once the app is running;
+# system packages can only be added at BUILD time (i.e. baked into the image via a Dockerfile).
+# So _find_chromium() no longer wastes a request pretending an install might succeed — it does
+# one fast, cached lookup and returns a message that tells you exactly what to do (see
+# Dockerfile / render.yaml shipped alongside this file).
+_CHROMIUM_BIN_CACHE = {"path": None, "checked": False}
+_CHROMIUM_NAMES = ("chromium","chromium-browser","google-chrome","google-chrome-stable","chrome")
+_CHROMIUM_EXTRA_PATHS = ("/usr/bin/chromium","/usr/bin/chromium-browser","/usr/bin/google-chrome",
+                          "/snap/bin/chromium","/usr/lib/chromium/chromium","/usr/lib/chromium-browser/chromium-browser")
 def _find_chromium(try_install=True):
     """Locate a real Chromium/Chrome binary on the host, cached after first check.
-    If none is found and try_install is True, attempt a one-time silent install
-    via apt-get (works on most Debian/Ubuntu-based hosts running as root)."""
+    `try_install` is accepted for backwards compatibility but is a no-op — see note above."""
     if _CHROMIUM_BIN_CACHE["checked"]: return _CHROMIUM_BIN_CACHE["path"]
-    names = ("chromium","chromium-browser","google-chrome","google-chrome-stable","chrome")
-    extra_paths = ("/usr/bin/chromium","/usr/bin/chromium-browser","/usr/bin/google-chrome",
-                   "/snap/bin/chromium","/usr/lib/chromium/chromium","/usr/lib/chromium-browser/chromium-browser")
-    for name in names:
+    for name in _CHROMIUM_NAMES:
         p = _sh.which(name)
         if p: _CHROMIUM_BIN_CACHE.update(path=p, checked=True); return p
-    for p in extra_paths:
+    for p in _CHROMIUM_EXTRA_PATHS:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             _CHROMIUM_BIN_CACHE.update(path=p, checked=True); return p
-    if try_install and not _CHROMIUM_BIN_CACHE["install_tried"]:
-        _CHROMIUM_BIN_CACHE["install_tried"] = True
-        try:
-            # Best-effort, silent, short-timeout install — safe no-op if not root / no apt / no network.
-            subprocess.run("apt-get update -qq && apt-get install -y -qq chromium chromium-browser 2>/dev/null || true",
-                            shell=True, timeout=90, capture_output=True)
-        except Exception:
-            pass
-        for name in names:
-            p = _sh.which(name)
-            if p: _CHROMIUM_BIN_CACHE.update(path=p, checked=True); return p
     _CHROMIUM_BIN_CACHE["checked"] = True
     return None
 
@@ -9767,9 +10029,11 @@ def _run_chromium(url, mode="screenshot", timeout=25):
     Returns (ok, data_or_error, content_type)."""
     bin_path = _find_chromium()
     if not bin_path:
-        return False, ("No real Chromium binary found on this host. Install it with "
-                        "'apt-get install -y chromium' (Debian/Ubuntu) or add it to your "
-                        "Dockerfile, then restart the server."), "text/plain"
+        return False, ("No real Chromium binary found on this host. On Render this means the "
+                        "service is deployed on the native Python runtime, which can't install "
+                        "system packages at runtime. Switch the service to 'Docker' and deploy "
+                        "with the Dockerfile shipped alongside this file (it installs Chromium "
+                        "at build time) — see DEPLOY_RENDER.md."), "text/plain"
     tmp_dir = _tf.mkdtemp(prefix="fos_chromium_")
     try:
         base_flags = [bin_path,"--headless=new","--disable-gpu","--no-sandbox",
@@ -9832,7 +10096,204 @@ async def api_fos_chromium_status(request: Request):
     """Report whether a real Chromium binary is available on this host."""
     auth_user(request)
     p = _find_chromium()
-    return J({"available": bool(p), "path": p or ""})
+    hint = "" if p else ("No Chromium binary on this host. On Render, switch this service to "
+                          "'Docker' and deploy with the included Dockerfile (installs Chromium "
+                          "at build time) — see DEPLOY_RENDER.md.")
+    return J({"available": bool(p), "path": p or "", "hint": hint})
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── MCP (Model Context Protocol) client ──────────────────────────────────
+# JSON-RPC 2.0 over the "Streamable HTTP" transport (MCP spec 2025-06-18):
+# a single POST endpoint per server that can answer either with a plain
+# application/json body or a text/event-stream carrying one JSON-RPC message.
+# ══════════════════════════════════════════════════════════════════════════
+def _mcp_headers(extra=None):
+    h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if extra:
+        for k, v in extra.items():
+            if k and v: h[str(k)] = str(v)
+    return h
+
+def _mcp_parse_response(resp):
+    """Parse a JSON-RPC message out of either a plain JSON body or an SSE stream."""
+    ctype = resp.headers.get("content-type", "")
+    if "text/event-stream" in ctype:
+        for raw_line in resp.iter_lines():
+            if not raw_line: continue
+            line = raw_line.decode("utf-8", "replace") if isinstance(raw_line, bytes) else raw_line
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if not payload: continue
+                try: return json.loads(payload)
+                except Exception: continue
+        raise RuntimeError("Server sent an SSE stream with no JSON-RPC message in it")
+    try:
+        return resp.json()
+    except Exception:
+        raise RuntimeError(f"Server did not return valid JSON (got {ctype or 'unknown content-type'})")
+
+def _mcp_rpc(url, method, params=None, headers=None, session_id=None, timeout=20, rpc_id=1):
+    hdrs = _mcp_headers(headers)
+    if session_id: hdrs["Mcp-Session-Id"] = session_id
+    body = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
+    if params is not None: body["params"] = params
+    try:
+        r = req.post(url, headers=hdrs, json=body, timeout=timeout, stream=True)
+    except Exception as ex:
+        raise RuntimeError(f"Could not reach {url}: {ex}")
+    if not r.ok:
+        raise RuntimeError(f"Server returned HTTP {r.status_code}: {r.text[:300]}")
+    new_session = r.headers.get("Mcp-Session-Id") or session_id
+    msg = _mcp_parse_response(r)
+    if isinstance(msg, dict) and msg.get("error"):
+        e = msg["error"]
+        raise RuntimeError(e.get("message", str(e)) if isinstance(e, dict) else str(e))
+    return (msg or {}).get("result"), new_session
+
+def _mcp_list_tools(url, headers=None, timeout=20):
+    """Full handshake — initialize, notifications/initialized, tools/list."""
+    init_result, session_id = _mcp_rpc(url, "initialize", {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "FusionAI", "version": "1.0"},
+    }, headers=headers, timeout=timeout, rpc_id=1)
+    try:
+        hdrs = _mcp_headers(headers)
+        if session_id: hdrs["Mcp-Session-Id"] = session_id
+        req.post(url, headers=hdrs, json={"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout=timeout)
+    except Exception:
+        pass  # best-effort — some servers don't require this notification at all
+    tools_result, session_id2 = _mcp_rpc(url, "tools/list", {}, headers=headers,
+                                          session_id=session_id, timeout=timeout, rpc_id=2)
+    return (tools_result or {}).get("tools", []), (session_id2 or session_id)
+
+def _mcp_call_tool(url, tool_name, arguments, headers=None, session_id=None, timeout=45):
+    result, _ = _mcp_rpc(url, "tools/call", {"name": tool_name, "arguments": arguments or {}},
+                          headers=headers, session_id=session_id, timeout=timeout, rpc_id=3)
+    return result
+
+@app.get("/api/mcp/servers")
+async def mcp_list_servers(request: Request):
+    u = auth_user(request)
+    with db() as c:
+        rows = c.execute("SELECT id,name,url,enabled,last_status,last_checked FROM mcp_servers WHERE user_id=? ORDER BY id", (u["id"],)).fetchall()
+    return J({"servers": [dict(r) for r in rows]})
+
+@app.post("/api/mcp/servers")
+async def mcp_add_server(request: Request):
+    u = auth_user(request); d = await request.json()
+    name = (d.get("name") or "").strip(); url = (d.get("url") or "").strip()
+    headers = d.get("headers") or {}
+    if not name or not url: return err("Name and URL required")
+    if not (url.startswith("http://") or url.startswith("https://")): return err("URL must start with http:// or https://")
+    if not isinstance(headers, dict): return err("headers must be an object")
+    with db() as c:
+        cur = c.execute("INSERT INTO mcp_servers(user_id,name,url,headers_json,enabled,ts)VALUES(?,?,?,?,1,?)",
+                         (u["id"], name, url, json.dumps(headers), _now()))
+        sid = cur.lastrowid
+    return J({"ok": True, "id": sid})
+
+@app.post("/api/mcp/servers/{server_id}/delete")
+async def mcp_delete_server(server_id: int, request: Request):
+    u = auth_user(request)
+    with db() as c: c.execute("DELETE FROM mcp_servers WHERE id=? AND user_id=?", (server_id, u["id"]))
+    return J({"ok": True})
+
+@app.post("/api/mcp/servers/{server_id}/toggle")
+async def mcp_toggle_server(server_id: int, request: Request):
+    u = auth_user(request); d = await request.json()
+    with db() as c: c.execute("UPDATE mcp_servers SET enabled=? WHERE id=? AND user_id=?", (1 if d.get("enabled") else 0, server_id, u["id"]))
+    return J({"ok": True})
+
+@app.post("/api/mcp/servers/{server_id}/tools")
+async def mcp_server_tools(server_id: int, request: Request):
+    """Connect to the server and list the tools it exposes."""
+    u = auth_user(request)
+    with db() as c: row = c.execute("SELECT * FROM mcp_servers WHERE id=? AND user_id=?", (server_id, u["id"])).fetchone()
+    if not row: return err("Server not found", 404)
+    try: headers = json.loads(row["headers_json"] or "{}")
+    except Exception: headers = {}
+    try:
+        tools, _sess = _mcp_list_tools(row["url"], headers=headers)
+        with db() as c: c.execute("UPDATE mcp_servers SET last_status=?,last_checked=? WHERE id=?", ("ok", _now(), server_id))
+        return J({"ok": True, "tools": tools})
+    except Exception as ex:
+        with db() as c: c.execute("UPDATE mcp_servers SET last_status=?,last_checked=? WHERE id=?", (f"error: {ex}"[:300], _now(), server_id))
+        return err(f"Could not connect to MCP server: {ex}")
+
+@app.post("/api/mcp/servers/{server_id}/call")
+async def mcp_server_call(server_id: int, request: Request):
+    """Manually invoke one tool on a connected MCP server and return its result."""
+    u = auth_user(request); d = await request.json()
+    tool_name = (d.get("tool") or "").strip(); arguments = d.get("arguments") or {}
+    if not tool_name: return err("tool name required")
+    with db() as c: row = c.execute("SELECT * FROM mcp_servers WHERE id=? AND user_id=?", (server_id, u["id"])).fetchone()
+    if not row: return err("Server not found", 404)
+    try: headers = json.loads(row["headers_json"] or "{}")
+    except Exception: headers = {}
+    try:
+        result = _mcp_call_tool(row["url"], tool_name, arguments, headers=headers)
+        return J({"ok": True, "result": result})
+    except Exception as ex:
+        return err(f"Tool call failed: {ex}")
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Skills — reusable instruction bundles the user can toggle on/off ────────
+# When enabled, a skill's instructions get folded into the system prompt for
+# every chat message (see /api/chat above). Optionally references MCP servers
+# so the UI can show "this skill uses: <server>" — the model itself doesn't
+# auto-invoke MCP tools yet (see /api/mcp/servers/{id}/call for manual use);
+# that's a natural next step once this base is in daily use.
+# ══════════════════════════════════════════════════════════════════════════
+@app.get("/api/skills")
+async def list_skills(request: Request):
+    u = auth_user(request)
+    with db() as c:
+        rows = c.execute("SELECT id,name,icon,description,instructions,mcp_server_ids,enabled FROM skills WHERE user_id=? ORDER BY id", (u["id"],)).fetchall()
+    return J({"skills": [dict(r) for r in rows]})
+
+@app.post("/api/skills")
+async def create_skill(request: Request):
+    u = auth_user(request); d = await request.json()
+    name = (d.get("name") or "").strip()
+    instructions = (d.get("instructions") or "").strip()
+    if not name or not instructions: return err("Name and instructions required")
+    icon = (d.get("icon") or "\U0001F9E9").strip()[:8]
+    description = (d.get("description") or "").strip()
+    mcp_ids = d.get("mcp_server_ids") or []
+    if not isinstance(mcp_ids, list): mcp_ids = []
+    with db() as c:
+        cur = c.execute("INSERT INTO skills(user_id,name,icon,description,instructions,mcp_server_ids,enabled,ts)VALUES(?,?,?,?,?,?,0,?)",
+                         (u["id"], name, icon, description, instructions, json.dumps(mcp_ids), _now()))
+        sid = cur.lastrowid
+    return J({"ok": True, "id": sid})
+
+@app.post("/api/skills/{skill_id}/update")
+async def update_skill(skill_id: int, request: Request):
+    u = auth_user(request); d = await request.json()
+    with db() as c:
+        row = c.execute("SELECT * FROM skills WHERE id=? AND user_id=?", (skill_id, u["id"])).fetchone()
+        if not row: return err("Skill not found", 404)
+        name = (d.get("name") if "name" in d else row["name"])
+        icon = (d.get("icon") if "icon" in d else row["icon"])
+        description = (d.get("description") if "description" in d else row["description"])
+        instructions = (d.get("instructions") if "instructions" in d else row["instructions"])
+        mcp_ids = d.get("mcp_server_ids") if "mcp_server_ids" in d else json.loads(row["mcp_server_ids"] or "[]")
+        c.execute("UPDATE skills SET name=?,icon=?,description=?,instructions=?,mcp_server_ids=? WHERE id=?",
+                   (name, icon, description, instructions, json.dumps(mcp_ids), skill_id))
+    return J({"ok": True})
+
+@app.post("/api/skills/{skill_id}/delete")
+async def delete_skill(skill_id: int, request: Request):
+    u = auth_user(request)
+    with db() as c: c.execute("DELETE FROM skills WHERE id=? AND user_id=?", (skill_id, u["id"]))
+    return J({"ok": True})
+
+@app.post("/api/skills/{skill_id}/toggle")
+async def toggle_skill(skill_id: int, request: Request):
+    u = auth_user(request); d = await request.json()
+    with db() as c: c.execute("UPDATE skills SET enabled=? WHERE id=? AND user_id=?", (1 if d.get("enabled") else 0, skill_id, u["id"]))
+    return J({"ok": True})
 
 @app.post("/api/fos/exec")
 async def api_fos_exec(request: Request):
@@ -9861,10 +10322,13 @@ async def api_fos_exec(request: Request):
         url = arg if arg.startswith("http") else "https://"+arg
         bin_path = _find_chromium()
         if not bin_path:
-            return J({"stdout":"","stderr":("No real Chromium binary found on this host.\nInstall with: apt-get install -y chromium   (Debian/Ubuntu)\nor add 'chromium' to your Dockerfile, then restart the server."),"code":1,"cwd":cwd_rel})
+            return J({"stdout":"","stderr":("No real Chromium binary found on this host.\nOn Render, switch this service to 'Docker' and deploy with the included Dockerfile\n(installs Chromium at build time — a runtime apt-get cannot work on Render's native\nPython runtime since the process has no root/apt access once it's serving traffic).\nSee DEPLOY_RENDER.md."),"code":1,"cwd":cwd_rel})
         ok, data, ctype = _run_chromium(url, mode="text")
         if not ok: return J({"stdout":"","stderr":str(data),"code":1,"cwd":cwd_rel})
         return J({"stdout":f"✅ Rendered {url} with real Chromium ({bin_path}):\n\n{data}","stderr":"","code":0,"cwd":cwd_rel})
+    if low == "ver":
+        return J({"stdout":"FusionOS [Version 11.0.26100] — PowerShell-style prompt over a real Linux shell","stderr":"","code":0,"cwd":cwd_rel})
+    cmd = _fos_win_alias(cmd)
     stdout, stderr, code = _fos_run(cmd, workdir)
     return J({"stdout": stdout, "stderr": stderr, "code": code, "cwd": cwd_rel})
 
