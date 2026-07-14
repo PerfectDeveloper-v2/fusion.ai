@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: fusionai
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: 10000
+      # Add your provider keys here (or set them in the Render dashboard instead —
+      # that's usually easier since it avoids committing secrets to the repo):
+      # - key: GROQ_KEY
+      #   sync: false
+      # - key: OPENROUTER_KEY
+      #   sync: false
+      # - key: SECRET_KEY
+      #   generateValue: true
+    # Render's FREE plan does not support persistent disks — only paid plans do.
+    # Without a disk mounted at /data, SQLite (users, chats, keys) resets on every
+    # restart/redeploy/spin-down, same as it did before. If you want logins and
+    # chat history to actually survive, either:
+    #   1) upgrade the plan and add a disk mounted at /data, or
+    #   2) point the app at an external DB instead of SQLite (bigger change).
+    # disks:
+    #   - name: fusionai-data
+    #     mountPath: /data
+    #     sizeGB: 1

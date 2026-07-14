@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+cryptography
+requests
+python-docx
+lxml
+openpyxl
+python-pptx
