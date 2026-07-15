@@ -1412,22 +1412,30 @@ _SERP_CACHE = {}
 _SERP_CACHE_TTL = 900  # 15 minutes
 _SERP_CACHE_MAX = 300  # simple size cap to avoid unbounded growth
 
-def _openserp_query(query, timeout=12, retries=1):
+def _openserp_query(query, timeout=12, retries=1, lang=None, country=None):
     """Query the self-hosted OpenSERP instance and return (instant, results).
     Real response shape: {"results":[{title,url,snippet,domain,rank,...}],
     "serp_features":[{"type":"ai_summary","text":...}, {"type":"related_searches",...}]}
     NOT a flat list — this was the root cause of empty/'crappy' results before.
-    Cached in-memory for _SERP_CACHE_TTL seconds since the backing VPS is slow/free-tier."""
-    cache_key = query.strip().lower()
+    Cached in-memory for _SERP_CACHE_TTL seconds since the backing VPS is slow/free-tier.
+    lang/country are optional locale hints (e.g. lang='en', country='us') passed straight
+    through as query params — this matches OpenSERP's usual ?lang=&country= convention.
+    NOTE: could not be verified live against openserp.alwaysdata.net from the dev sandbox
+    this was built in (that host isn't reachable from there) — if OpenSERP actually expects
+    a different param name/shape for locale, paste a working URL and this gets adjusted to
+    match exactly."""
+    cache_key = f"{query.strip().lower()}|{lang or ''}|{country or ''}"
     cached = _SERP_CACHE.get(cache_key)
     if cached and (_time.time() - cached[0]) < _SERP_CACHE_TTL:
         return cached[1], cached[2]
     import urllib.parse as _uq
-    base = "https://openserp.alwaysdata.net/bing/search?text="
+    base = "https://openserp.alwaysdata.net/bing/search?text=" + _uq.quote(query)
+    if lang: base += "&lang=" + _uq.quote(lang)
+    if country: base += "&country=" + _uq.quote(country)
     last_err = None
     for attempt in range(retries + 1):
         try:
-            r = req.get(base + _uq.quote(query),
+            r = req.get(base,
                         headers={"User-Agent":"FusionAI/2.0","Accept":"application/json"},
                         timeout=timeout)
             if not r.ok:
@@ -1465,8 +1473,10 @@ async def web_search_proxy(request:Request):
     """Bing search via OpenSERP — returns clean JSON results."""
     auth_user(request); d=await request.json()
     query=d.get("query","").strip()
+    lang=(d.get("lang") or "").strip() or None
+    country=(d.get("country") or "").strip() or None
     if not query: return J({"ok":False,"error":"query required","results":[]})
-    instant, results = _openserp_query(query, timeout=12, retries=1)
+    instant, results = _openserp_query(query, timeout=12, retries=1, lang=lang, country=country)
     if not results and not instant:
         return J({"ok":False,"error":"Search backend returned no results — it may be slow or temporarily down. Try again in a moment.","results":[]})
     return J({"ok":True,"query":query,"instant":instant,"results":results[:10]})
@@ -9046,7 +9056,7 @@ function _fosBrowser(body,id,startUrl){
       +'<button class="comp-chip" onclick="_fosBLoad(\''+id+'\',\'https://news.ycombinator.com\')">HN</button>'
     +'</div>'
     +'<div id="'+id+'-info" style="display:none;padding:6px 10px;font-size:10px;color:rgba(255,255,255,.35);border-bottom:1px solid rgba(255,255,255,.04);flex-shrink:0">Loading via proxy…</div>'
-    +'<iframe id="'+id+'-fr" class="fos-frame" src="about:blank" referrerpolicy="no-referrer"></iframe>'
+    +'<iframe id="'+id+'-fr" class="fos-frame" src="about:blank" referrerpolicy="no-referrer" sandbox="allow-scripts allow-forms allow-popups allow-modals"></iframe>'
     +'<div id="'+id+'-chromeView" style="display:none;flex:1;overflow:auto;background:#0a0a12;text-align:center;padding:10px">'
       +'<img id="'+id+'-chromeImg" style="max-width:100%;border-radius:6px;box-shadow:0 4px 24px rgba(0,0,0,.5)"/>'
       +'<div id="'+id+'-chromeMsg" style="color:rgba(255,255,255,.4);font-size:12px;padding:20px"></div>'
@@ -10550,8 +10560,13 @@ async def api_fos_proxy(request: Request, url: str = ""):
         base = f'<base href="{url}" target="_blank">'
         html = _rfp.sub(r'(?i)<head>', '<head>' + base, html, count=1)
         if '<base' not in html: html = base + html
-        # Strip frame-buster scripts
-        html = _rfp.sub(r'(?is)<script[^>]*>.*?</script>', '', html)
+        # NOTE: we used to strip every <script> tag here to defang frame-busters
+        # ("if(top!==self) top.location=...") but that also killed all real page
+        # JS — which is most of why the page looked like a dead screenshot instead
+        # of an actual interactive site. The iframe's `sandbox` attribute (set on
+        # the client side) is a much better fence: it still runs the page's JS,
+        # it just can't navigate the parent frame, so frame-busting attempts are
+        # neutralized without gutting the site.
         return HTMLResponse(html, headers={
             "Content-Type": "text/html; charset=utf-8",
             "X-Frame-Options": "ALLOWALL",
